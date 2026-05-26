@@ -1,0 +1,1388 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Cross-Broker Portfolio</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Cross-broker portfolio dashboard</p>
+          <h1>统一看国泰海通 PDF、IBKR Flex Query、真实净值和最简调仓建议</h1>
+          <p class="lede">
+            一套本地账本，先把现金流、持仓、收益口径和调仓动作理顺，再把图表和建议自然长出来。
+          </p>
+        </div>
+        <div class="hero-note">
+          <p>基准货币</p>
+          <strong>{{ dashboard.summary.base_currency }}</strong>
+          <span>{{ dashboard.summary.imported_transactions }} 笔已入库流水</span>
+        </div>
+      </section>
+
+      {% if message %}
+      <section class="flash flash-ok">{{ message }}</section>
+      {% endif %}
+      {% if error %}
+      <section class="flash flash-err">{{ error }}</section>
+      {% endif %}
+
+      <section class="grid forms">
+        <form method="post" action="/actions/import-gtja" class="panel">
+          <h2>导入国泰海通 PDF</h2>
+          <label for="pdf_path">PDF 路径</label>
+          <input id="pdf_path" name="pdf_path" type="text" value="{{ sample_pdf_path }}">
+          <p class="hint">当前默认就是你给的样本路径，直接点导入就会测试解析并入库。</p>
+          <button type="submit">导入对账单</button>
+        </form>
+
+        <form method="post" action="/actions/sync-ibkr" class="panel">
+          <h2>同步 IBKR Flex Query</h2>
+          <label for="service_url">Flex Web Service 地址</label>
+          <input id="service_url" name="service_url" type="text" value="{{ ibkr_service_url }}">
+          <label for="token">Flex Token</label>
+          <input id="token" name="token" type="password" value="">
+          <label for="query_id">Query ID</label>
+          <input id="query_id" name="query_id" type="text" value="">
+          <p class="hint">这里不再走本地 Web Portal。直接用 IBKR Flex Web Service 的 token 和 Activity Flex Query id 拉 XML 报表。</p>
+          <button type="submit">同步 IBKR</button>
+        </form>
+      </section>
+
+      <section class="grid forms">
+        <form method="post" action="/actions/import-ibkr-xml" class="panel">
+          <h2>补导入 IBKR 开户期 XML</h2>
+          <label for="xml_path">Flex XML 路径</label>
+          <input id="xml_path" name="xml_path" type="text" value="{{ sample_xml_path }}">
+          <p class="hint">这条会把你手动导出的开户早期 XML 补进来，用来对齐早期入金、换汇和最初建仓。</p>
+          <button type="submit">导入 XML 历史</button>
+        </form>
+
+        <article class="panel sync-status-panel">
+          <div class="panel-head">
+            <h2>价格同步状态</h2>
+            <span>进入页面会自动定向刷新当前持仓价格</span>
+          </div>
+          <dl class="sync-status-grid">
+            <div>
+              <dt>最近成功同步</dt>
+              <dd>{{ market_sync.last_success_at }}</dd>
+            </div>
+            <div>
+              <dt>最近方式</dt>
+              <dd>{{ market_sync.last_source }} / {{ market_sync.last_mode }}</dd>
+            </div>
+            <div>
+              <dt>当前持仓覆盖</dt>
+              <dd>{{ market_sync.active_count }} 个产品</dd>
+            </div>
+            <div>
+              <dt>最近写入</dt>
+              <dd>{{ market_sync.last_price_rows }} 条价格，{{ market_sync.last_fx_rows }} 条汇率</dd>
+            </div>
+          </dl>
+          <p class="hint">{{ market_sync.page_status }}</p>
+          <form method="post" action="/actions/refresh-market-data" class="inline-form">
+            <input type="hidden" name="mode" value="full">
+            <button type="submit">手动全量刷新历史汇率和股价</button>
+          </form>
+          <p class="hint">自动刷新会在 {{ market_sync.auto_window_minutes }} 分钟窗口内复用最近一次结果，重点更新当前持仓价格；整包汇率和全历史仍由手动按钮兜底。</p>
+        </article>
+      </section>
+
+      <section class="grid summary">
+        <article class="metric">
+          <span>总资产净值</span>
+          <strong>{{ "%.2f"|format(dashboard.summary.total_market_value) }}</strong>
+        </article>
+        <article class="metric">
+          <span>净投入本金</span>
+          <strong>{{ "%.2f"|format(dashboard.summary.net_contribution) }}</strong>
+        </article>
+        <article class="metric">
+          <span>总收益</span>
+          <strong>{{ "%.2f"|format(dashboard.summary.total_return) }}</strong>
+        </article>
+        <article class="metric">
+          <span>现金余额</span>
+          <strong>{{ "%.2f"|format(dashboard.summary.cash_total) }}</strong>
+        </article>
+      </section>
+
+      <section class="panel chart-origin-panel">
+        <div class="panel-head">
+          <h2>收益起点</h2>
+          <span id="chart-origin-caption">只重算收益额和收益率，总资产与本金保持原始金额刻度。</span>
+        </div>
+        <div class="chart-origin-controls">
+          <label class="origin-field">
+            <span>开始日期</span>
+            <input id="chart-origin-date" type="date">
+          </label>
+          <button id="chart-origin-reset" type="button" class="ghost-button">回到最早</button>
+          <label class="checkbox">
+            <input id="chart-origin-follow-view" type="checkbox">
+            <span>跟随当前视窗左边界自动重算</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel interactive-chart-panel">
+        <div class="panel-head">
+          <h2>本金 / 转账 / 收益走势</h2>
+          <span>滚轮缩放，拖动平移，双击重置，悬停看数值</span>
+        </div>
+        <div class="chart-controls">
+          <button type="button" class="ghost-button" data-zoom="in">放大</button>
+          <button type="button" class="ghost-button" data-zoom="out">缩小</button>
+          <button type="button" class="ghost-button" data-zoom="reset">重置</button>
+        </div>
+        <div class="chart-legend">
+          <button type="button" class="legend-chip active" data-series="nav"><span class="swatch nav"></span>总资产</button>
+          <button type="button" class="legend-chip active" data-series="contribution"><span class="swatch contribution"></span>本金 / 转账</button>
+          <button type="button" class="legend-chip active" data-series="profit"><span class="swatch profit"></span>收益额</button>
+        </div>
+        <div class="interactive-chart-shell">
+          <svg id="trend-chart" viewBox="0 0 1100 360" preserveAspectRatio="none" aria-label="Portfolio trend chart"></svg>
+          <div id="trend-tooltip" class="chart-tooltip" hidden></div>
+        </div>
+      </section>
+
+      <section class="panel interactive-chart-panel">
+        <div class="panel-head">
+          <h2>收益率走势</h2>
+          <span>总市值 TWR、有效投资额 TWR、最大成本收益率</span>
+        </div>
+        <div class="chart-benchmark-controls">
+          <label class="origin-field">
+            <span>对比产品行情</span>
+            <select id="rate-benchmark-select">
+              <option value="">不对比</option>
+              {% for item in dashboard.benchmark_choices %}
+              <option value="{{ item.id }}">{{ item.label }} · {{ item.currency }}</option>
+              {% endfor %}
+            </select>
+          </label>
+        </div>
+        <div class="chart-controls">
+          <button type="button" class="ghost-button" data-rate-zoom="in">放大</button>
+          <button type="button" class="ghost-button" data-rate-zoom="out">缩小</button>
+          <button type="button" class="ghost-button" data-rate-zoom="reset">重置</button>
+        </div>
+        <div class="chart-legend">
+          <button type="button" class="legend-chip active" data-rate-series="totalTwr"><span class="swatch nav"></span>总市值 TWR</button>
+          <button type="button" class="legend-chip active" data-rate-series="effectiveTwr"><span class="swatch contribution"></span>有效投资额 TWR</button>
+          <button type="button" class="legend-chip active" data-rate-series="peakCostRate"><span class="swatch profit"></span>最大成本收益率</button>
+          <button type="button" class="legend-chip active" data-rate-series="benchmark" id="rate-benchmark-chip" hidden><span class="swatch benchmark"></span><span id="rate-benchmark-chip-label">对比行情</span></button>
+        </div>
+        <div class="interactive-chart-shell">
+          <svg id="rate-chart" viewBox="0 0 1100 360" preserveAspectRatio="none" aria-label="Portfolio return-rate chart"></svg>
+          <div id="rate-tooltip" class="chart-tooltip" hidden></div>
+        </div>
+      </section>
+
+      <section class="panel calendar-panel">
+        <div class="panel-head">
+          <h2>投资盈利日历</h2>
+          <span>先看每年，再点到月份和每天；支持收益额 / 收益率切换</span>
+        </div>
+        <div class="calendar-toolbar">
+          <div class="calendar-metric-toggle">
+            <button type="button" class="calendar-toggle active" data-calendar-metric="amount">收益额</button>
+            <button type="button" class="calendar-toggle" data-calendar-metric="rate">收益率</button>
+          </div>
+          <div id="calendar-breadcrumb" class="calendar-breadcrumb"></div>
+        </div>
+        <div class="calendar-layout">
+          <div class="calendar-main">
+            <div id="calendar-summary" class="calendar-summary"></div>
+            <div id="calendar-grid" class="calendar-grid-view"></div>
+          </div>
+          <aside id="calendar-detail" class="calendar-detail"></aside>
+        </div>
+      </section>
+
+      <section class="grid allocations">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>产品分配</h2>
+          </div>
+          <table>
+            <thead>
+              <tr><th>产品</th><th>类别</th><th>金额</th><th>占比</th></tr>
+            </thead>
+            <tbody>
+              {% for item in dashboard.allocation.product %}
+              <tr>
+                <td>
+                  <strong>{{ item.name }}</strong>
+                  <span class="muted">{{ item.symbol }}</span>
+                </td>
+                <td>{{ item.asset_class }}</td>
+                <td>{{ "%.2f"|format(item.market_value_base) }}</td>
+                <td>{{ "%.2f"|format(item.weight * 100) }}%</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+        <article class="panel">
+          <div class="panel-head">
+            <h2>市场占比</h2>
+          </div>
+          <table>
+            <thead>
+              <tr><th>市场</th><th>金额</th><th>占比</th></tr>
+            </thead>
+            <tbody>
+              {% for item in dashboard.allocation.market %}
+              <tr>
+                <td>{{ item.label }}</td>
+                <td>{{ "%.2f"|format(item.market_value_base) }}</td>
+                <td>{{ "%.2f"|format(item.weight * 100) }}%</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+      </section>
+
+      <section class="grid rebalance">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>最简再平衡</h2>
+            <span>先选你想平衡的子集，再输入这些产品在子集内要变成什么比例</span>
+          </div>
+          <form method="post" action="/actions/rebalance">
+            <label>参与再平衡的产品</label>
+            <div class="rebalance-picker">
+              {% for item in dashboard.allocation.product %}
+              <label class="picker-item">
+                <input
+                  type="checkbox"
+                  name="selected_rebalance"
+                  value="{{ item.label }}"
+                  {% if not selected_rebalance_labels or item.label in selected_rebalance_labels %}checked{% endif %}
+                >
+                <span>
+                  <strong>{{ item.name }}</strong>
+                  <em>{{ item.symbol }} · {{ "%.2f"|format(item.weight * 100) }}%</em>
+                </span>
+              </label>
+              {% endfor %}
+            </div>
+            <label for="targets">目标配置</label>
+            <textarea id="targets" name="targets" rows="8">{{ custom_targets }}</textarea>
+            <p class="hint">这里的百分比只在你勾选的子集内归一化。没有勾选时，默认按全部当前持仓来算。</p>
+            <button type="submit">计算调仓建议</button>
+          </form>
+        </article>
+        <article class="panel">
+          <div class="panel-head">
+            <h2>建议动作</h2>
+            {% if rebalance.subset_total %}
+            <span>当前子集规模 {{ "%.2f"|format(rebalance.subset_total) }}</span>
+            {% endif %}
+          </div>
+          {% if rebalance.actions %}
+          <ul class="actions">
+            {% for item in rebalance.actions %}
+            <li>
+              <strong>{{ item.action }}</strong>
+            <span>{{ item.bucket }}</span>
+            <span>{{ "%.2f"|format(item.amount_base) }}</span>
+            <em>{{ item.reason }}</em>
+            </li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          <p class="hint">当前没有明显偏离，或者还没有足够的持仓数据。</p>
+          {% endif %}
+          <table>
+            <thead>
+              <tr><th>类别</th><th>当前</th><th>目标</th><th>差额</th></tr>
+            </thead>
+            <tbody>
+              {% for item in rebalance.drift %}
+              <tr>
+                <td>{{ item.label }}</td>
+                <td>{{ "%.2f"|format(item.current_percent) }}%</td>
+                <td>{{ "%.2f"|format(item.target_percent) }}%</td>
+                <td>{{ "%.2f"|format(item.delta_value) }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>产品分析</h2>
+          <span>主行按 {{ dashboard.summary.base_currency }} 折算，次行保留产品本币；收益折算使用当前汇率做横向比较</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>产品</th>
+              <th>状态</th>
+              <th>类别</th>
+              <th>市场</th>
+              <th>数量</th>
+              <th>现价</th>
+              <th>市值</th>
+              <th>已实现</th>
+              <th>未实现</th>
+              <th>总收益</th>
+              <th>组合占比</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in dashboard.products %}
+            <tr>
+              <td>
+                <strong>{{ item.name }}</strong>
+                <span class="muted">{{ item.symbol }}</span>
+              </td>
+              <td>{{ "持有中" if item.status == "open" else "已清仓" }}</td>
+              <td>{{ item.asset_class }}</td>
+              <td>{{ item.market }}</td>
+              <td>{{ "%.2f"|format(item.quantity) }}</td>
+              <td>{{ "%.4f"|format(item.price) }} {{ item.price_currency }}</td>
+              <td>
+                <strong>{{ "%.2f"|format(item.market_value_base) }} {{ dashboard.summary.base_currency }}</strong>
+                {% if item.native_currency != dashboard.summary.base_currency %}
+                <span class="muted">本币 {{ "%.2f"|format(item.market_value) }} {{ item.native_currency }}</span>
+                {% endif %}
+              </td>
+              <td>
+                <strong>{{ "%.2f"|format(item.realized_pnl_base) }} {{ dashboard.summary.base_currency }}</strong>
+                <span class="muted">本币 {{ "%.2f"|format(item.realized_pnl) }} {{ item.native_currency }}</span>
+              </td>
+              <td>
+                <strong>{{ "%.2f"|format(item.unrealized_pnl_base) }} {{ dashboard.summary.base_currency }}</strong>
+                <span class="muted">本币 {{ "%.2f"|format(item.unrealized_pnl) }} {{ item.native_currency }}</span>
+              </td>
+              <td>
+                <strong>{{ "%.2f"|format(item.total_return_base) }} {{ dashboard.summary.base_currency }}</strong>
+                <span class="muted">本币 {{ "%.2f"|format(item.total_return) }} {{ item.native_currency }}</span>
+              </td>
+              <td>{{ "%.2f"|format(item.weight) }}%</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>最近流水</h2>
+          <span>最近 20 笔标准化交易记录</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>账户</th>
+              <th>动作</th>
+              <th>产品</th>
+              <th>数量</th>
+              <th>资金变化</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in dashboard.transactions %}
+            <tr>
+              <td>{{ item.date }}</td>
+              <td>{{ item.account }}</td>
+              <td>{{ item.activity }}</td>
+              <td>{{ item.name }}</td>
+              <td>{{ "%.2f"|format(item.quantity) }}</td>
+              <td>{{ "%.2f"|format(item.cash_amount) }} {{ item.currency }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel footer-note">
+        <div class="panel-head">
+          <h2>IBKR 你需要做的事</h2>
+        </div>
+        <ol>
+          <li>在 IBKR Client Portal 里创建一个 Activity Flex Query，并把 Trades、Cash Transactions、Open Positions、Cash Report 勾进去。</li>
+          <li>在 Flex Web Service Configuration 里生成 token，记下 query id。</li>
+          <li>把 token 和 query id 填进这个页面，再点“同步 IBKR”。</li>
+        </ol>
+      </section>
+    </main>
+    <script id="chart-data" type="application/json">{{ chart_payload|safe }}</script>
+    <script id="rate-chart-data" type="application/json">{{ rate_chart_payload|safe }}</script>
+    <script>
+      (() => {
+        const dimensions = { width: 1100, height: 360, padTop: 24, padRight: 18, padBottom: 42, padLeft: 18 };
+        const rawMoneyNode = document.getElementById("chart-data");
+        const rawRateNode = document.getElementById("rate-chart-data");
+        if (!rawMoneyNode || !rawRateNode) return;
+
+        const rawMoneyPayload = JSON.parse(rawMoneyNode.textContent);
+        const rawRatePayload = JSON.parse(rawRateNode.textContent);
+        const dates = (rawMoneyPayload.nav || []).map((point) => point.date);
+        const totalPoints = dates.length;
+        const sharedState = {
+          start: 0,
+          end: Math.max(0, totalPoints - 1),
+          manualOriginIndex: null,
+          followViewportOrigin: false,
+        };
+        const controllers = [];
+        const originDateInput = document.getElementById("chart-origin-date");
+        const originFollowCheckbox = document.getElementById("chart-origin-follow-view");
+        const originCaption = document.getElementById("chart-origin-caption");
+        const originResetButton = document.getElementById("chart-origin-reset");
+        const rateBenchmarkSelect = document.getElementById("rate-benchmark-select");
+        const rateBenchmarkChip = document.getElementById("rate-benchmark-chip");
+        const rateBenchmarkChipLabel = document.getElementById("rate-benchmark-chip-label");
+        const calendarGrid = document.getElementById("calendar-grid");
+        const calendarSummary = document.getElementById("calendar-summary");
+        const calendarDetail = document.getElementById("calendar-detail");
+        const calendarBreadcrumb = document.getElementById("calendar-breadcrumb");
+        const calendarMetricButtons = Array.from(document.querySelectorAll("[data-calendar-metric]"));
+        let selectedRateBenchmark = "";
+        const benchmarkSeriesCache = { ...(rawRatePayload.benchmarks || {}) };
+
+        function escapeHtml(text) {
+          return String(text)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;");
+        }
+
+        function round(value, digits = 4) {
+          const factor = 10 ** digits;
+          return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
+        }
+
+        function findIndexForDate(dateValue) {
+          if (!dateValue || !dates.length) return 0;
+          const index = dates.findIndex((item) => item >= dateValue);
+          return index === -1 ? Math.max(0, dates.length - 1) : index;
+        }
+
+        function getOriginIndex() {
+          if (sharedState.followViewportOrigin) return sharedState.start;
+          return typeof sharedState.manualOriginIndex === "number" ? sharedState.manualOriginIndex : null;
+        }
+
+        function clampWindow(start, end) {
+          if (!totalPoints) return { start: 0, end: 0 };
+          const desiredSize = Math.max(1, end - start + 1);
+          const minStart = sharedState.followViewportOrigin
+            ? 0
+            : (typeof sharedState.manualOriginIndex === "number" ? sharedState.manualOriginIndex : 0);
+          let nextStart = Math.max(minStart, Math.min(start, Math.max(minStart, totalPoints - desiredSize)));
+          let nextEnd = Math.min(totalPoints - 1, nextStart + desiredSize - 1);
+          if (nextEnd < nextStart) nextEnd = nextStart;
+          return { start: nextStart, end: nextEnd };
+        }
+
+        function describeOrigin() {
+          if (!dates.length) return "还没有图表数据。";
+          const originIndex = getOriginIndex();
+          if (originIndex === null) {
+            return "当前显示原始全量曲线；选择开始日期或勾选跟随视窗后，只会重算收益额和收益率。";
+          }
+          const originDate = dates[originIndex] || dates[0];
+          const mode = sharedState.followViewportOrigin ? "跟随当前视窗左边界" : "按手动开始日期";
+          return `当前从 ${originDate} 重新计算 ${mode} 下的收益额和收益率，总资产与本金保持原始金额。`;
+        }
+
+        function buildMoneyPayload(originIndex) {
+          if (originIndex === null) {
+            return {
+              baseCurrency: rawMoneyPayload.baseCurrency,
+              nav: rawMoneyPayload.nav || [],
+              contribution: rawMoneyPayload.contribution || [],
+              profit: rawMoneyPayload.profit || [],
+            };
+          }
+          const baseNav = rawMoneyPayload.nav?.[originIndex]?.value || 0.0;
+          const baseContribution = rawMoneyPayload.contribution?.[originIndex]?.value || 0.0;
+          const nav = rawMoneyPayload.nav || [];
+          const contribution = rawMoneyPayload.contribution || [];
+          const profit = dates.map((chartDate, index) => ({
+            date: chartDate,
+            value: round(
+              ((rawMoneyPayload.nav?.[index]?.value || 0.0) - baseNav)
+              - ((rawMoneyPayload.contribution?.[index]?.value || 0.0) - baseContribution),
+              2,
+            ),
+          }));
+          return {
+            baseCurrency: rawMoneyPayload.baseCurrency,
+            nav,
+            contribution,
+            profit,
+          };
+        }
+
+        function buildRatePayload(originIndex) {
+          if (originIndex === null) {
+            return {
+              totalTwr: rawRatePayload.totalTwr || [],
+              effectiveTwr: rawRatePayload.effectiveTwr || [],
+              peakCostRate: rawRatePayload.peakCostRate || [],
+            };
+          }
+          const originTotalFactor = 1 + ((rawRatePayload.totalTwr?.[originIndex]?.value || 0.0) / 100);
+          const originEffectiveFactor = 1 + ((rawRatePayload.effectiveTwr?.[originIndex]?.value || 0.0) / 100);
+          const safeTotalFactor = Math.abs(originTotalFactor) < 1e-9 ? 1.0 : originTotalFactor;
+          const safeEffectiveFactor = Math.abs(originEffectiveFactor) < 1e-9 ? 1.0 : originEffectiveFactor;
+          const baseNav = rawMoneyPayload.nav?.[originIndex]?.value || 0.0;
+          const baseContribution = rawMoneyPayload.contribution?.[originIndex]?.value || 0.0;
+          let runningPeakContribution = baseContribution;
+
+          const totalTwr = dates.map((chartDate, index) => {
+            const currentFactor = 1 + ((rawRatePayload.totalTwr?.[index]?.value || 0.0) / 100);
+            return {
+              date: chartDate,
+              value: round(((currentFactor / safeTotalFactor) - 1) * 100, 4),
+            };
+          });
+
+          const effectiveTwr = dates.map((chartDate, index) => {
+            const currentFactor = 1 + ((rawRatePayload.effectiveTwr?.[index]?.value || 0.0) / 100);
+            return {
+              date: chartDate,
+              value: round(((currentFactor / safeEffectiveFactor) - 1) * 100, 4),
+            };
+          });
+
+          const peakCostRate = dates.map((chartDate, index) => {
+            if (index >= originIndex) {
+              runningPeakContribution = Math.max(runningPeakContribution, rawMoneyPayload.contribution?.[index]?.value || 0.0);
+            }
+            const navDelta = (rawMoneyPayload.nav?.[index]?.value || 0.0) - baseNav;
+            const contributionDelta = (rawMoneyPayload.contribution?.[index]?.value || 0.0) - baseContribution;
+            const profitDelta = navDelta - contributionDelta;
+            return {
+              date: chartDate,
+              value: runningPeakContribution > 0 ? round((profitDelta / runningPeakContribution) * 100, 4) : 0.0,
+            };
+          });
+
+          return {
+            totalTwr,
+            effectiveTwr,
+            peakCostRate,
+          };
+        }
+
+        function getDerivedPayload(kind) {
+          const originIndex = getOriginIndex();
+          return kind === "rate" ? buildRatePayload(originIndex) : buildMoneyPayload(originIndex);
+        }
+
+        function refreshOriginUi() {
+          if (originDateInput && dates.length) {
+            originDateInput.min = dates[0];
+            originDateInput.max = dates[dates.length - 1];
+            originDateInput.value = typeof sharedState.manualOriginIndex === "number"
+              ? (dates[sharedState.manualOriginIndex] || "")
+              : "";
+          }
+          if (originFollowCheckbox) {
+            originFollowCheckbox.checked = sharedState.followViewportOrigin;
+          }
+          if (originCaption) {
+            originCaption.textContent = describeOrigin();
+          }
+          const selectedBenchmarkMeta = benchmarkSeriesCache?.[selectedRateBenchmark];
+          if (rateBenchmarkChip && rateBenchmarkChipLabel) {
+            if (selectedBenchmarkMeta) {
+              rateBenchmarkChip.hidden = false;
+              rateBenchmarkChipLabel.textContent = `${selectedBenchmarkMeta.label} 行情 (${selectedBenchmarkMeta.currency})`;
+            } else {
+              rateBenchmarkChip.hidden = true;
+              rateBenchmarkChipLabel.textContent = "对比行情";
+            }
+          }
+          if (rateBenchmarkSelect) {
+            rateBenchmarkSelect.value = selectedRateBenchmark;
+          }
+        }
+
+        function renderAll() {
+          refreshOriginUi();
+          controllers.forEach((controller) => controller.draw());
+          renderCalendar();
+        }
+
+        function resetWindow() {
+          const originIndex = getOriginIndex();
+          sharedState.start = originIndex === null ? 0 : originIndex;
+          sharedState.end = Math.max(sharedState.start, totalPoints - 1);
+          renderAll();
+        }
+
+        function buildBenchmarkSeries(benchmarkId, originIndex) {
+          if (!benchmarkId) return null;
+          const benchmarkMeta = benchmarkSeriesCache?.[benchmarkId];
+          const sourceSeries = benchmarkMeta?.series || [];
+          if (!sourceSeries.length) return null;
+          const anchorDate = originIndex === null ? dates[0] : dates[originIndex];
+          const baseIndex = sourceSeries.findIndex((point) => point.date >= anchorDate);
+          if (baseIndex === -1) return null;
+          const basePoint = sourceSeries[baseIndex];
+          let cursor = 0;
+          let lastPrice = null;
+          const points = dates.map((chartDate) => {
+            while (cursor < sourceSeries.length && sourceSeries[cursor].date <= chartDate) {
+              lastPrice = sourceSeries[cursor].value;
+              cursor += 1;
+            }
+            if (chartDate < basePoint.date || lastPrice === null || basePoint.value === 0) {
+              return { date: chartDate, value: null };
+            }
+            return {
+              date: chartDate,
+              value: round(((lastPrice / basePoint.value) - 1) * 100, 4),
+            };
+          });
+          return {
+            key: "benchmark",
+            label: `${benchmarkMeta.label} 行情 (${benchmarkMeta.currency})`,
+            color: "#7c3aed",
+            values: points,
+          };
+        }
+
+        function initInteractiveChart(config) {
+          const chart = document.getElementById(config.chartId);
+          const tooltip = document.getElementById(config.tooltipId);
+          if (!chart || !tooltip) return;
+
+          const toggles = Array.from(document.querySelectorAll(config.toggleSelector));
+          const zoomButtons = Array.from(document.querySelectorAll(config.zoomSelector));
+          const state = {
+            visible: {
+              ...Object.fromEntries(config.series.map((series) => [series.key, true])),
+              benchmark: true,
+            },
+            dragging: false,
+            dragStartX: 0,
+            dragStartStart: 0,
+            dragStartEnd: 0,
+          };
+
+          function getAllSeries() {
+            const payload = getDerivedPayload(config.kind);
+            const allSeries = Object.fromEntries(
+              config.series.map((series) => [
+                series.key,
+                { label: series.label, color: series.color, values: payload[series.payloadKey] || [] },
+              ]),
+            );
+            if (config.kind === "rate") {
+              const benchmarkSeries = buildBenchmarkSeries(selectedRateBenchmark, getOriginIndex());
+              if (benchmarkSeries) {
+                allSeries[benchmarkSeries.key] = benchmarkSeries;
+              }
+            }
+            return { payload, allSeries };
+          }
+
+          function getVisibleSeries(allSeries) {
+            return Object.entries(allSeries).filter(([key]) => state.visible[key]);
+          }
+
+          function getWindowedPoints() {
+            const { payload, allSeries } = getAllSeries();
+            const visibleSeries = getVisibleSeries(allSeries);
+            return {
+              payload,
+              seriesList: visibleSeries.map(([key, series]) => ({
+                key,
+                ...series,
+                points: series.values.slice(sharedState.start, sharedState.end + 1),
+              })),
+            };
+          }
+
+          function linePath(points, min, spread, plotWidth, plotHeight) {
+            let path = "";
+            let drawing = false;
+            points.forEach((point, index) => {
+              if (point.value === null || Number.isNaN(point.value)) {
+                drawing = false;
+                return;
+              }
+              const x = dimensions.padLeft + (index / Math.max(1, points.length - 1)) * plotWidth;
+              const y = dimensions.padTop + plotHeight - ((point.value - min) / spread) * plotHeight;
+              path += `${drawing ? " L" : "M"}${x.toFixed(2)} ${y.toFixed(2)}`;
+              drawing = true;
+            });
+            return path.trim();
+          }
+
+          function draw(hoverIndex = null) {
+            const { payload, seriesList } = getWindowedPoints();
+            const flatPoints = seriesList.flatMap((series) => series.points.map((point) => point.value)).filter((value) => value !== null && !Number.isNaN(value));
+            if (!flatPoints.length) {
+              chart.innerHTML = `<rect x="0" y="0" width="${dimensions.width}" height="${dimensions.height}" fill="#f8fafc"></rect>
+                <text x="24" y="180" fill="#64748b" font-size="14">No chart data yet</text>`;
+              return;
+            }
+
+            const plotWidth = dimensions.width - dimensions.padLeft - dimensions.padRight;
+            const plotHeight = dimensions.height - dimensions.padTop - dimensions.padBottom;
+            const min = Math.min(...flatPoints);
+            const max = Math.max(...flatPoints);
+            const spread = max - min || 1;
+            const count = seriesList[0].points.length;
+            const toX = (index) => dimensions.padLeft + (index / Math.max(1, count - 1)) * plotWidth;
+            const toY = (value) => dimensions.padTop + plotHeight - ((value - min) / spread) * plotHeight;
+            const firstDate = seriesList[0].points[0]?.date || "";
+            const lastDate = seriesList[0].points[count - 1]?.date || "";
+            const gridLines = Array.from({ length: 4 }, (_item, index) => {
+              const y = dimensions.padTop + (plotHeight / 3) * index;
+              return `<line x1="${dimensions.padLeft}" y1="${y}" x2="${dimensions.width - dimensions.padRight}" y2="${y}" stroke="rgba(15, 23, 42, 0.08)" stroke-width="1"></line>`;
+            }).join("");
+            const lineMarkup = seriesList.map((series) => (
+              `<path d="${linePath(series.points, min, spread, plotWidth, plotHeight)}" fill="none" stroke="${series.color}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"></path>`
+            )).join("");
+            let hoverMarkup = "";
+            if (hoverIndex !== null && hoverIndex >= 0 && hoverIndex < count) {
+              const x = toX(hoverIndex);
+              hoverMarkup += `<line x1="${x}" y1="${dimensions.padTop}" x2="${x}" y2="${dimensions.height - dimensions.padBottom}" stroke="rgba(15, 23, 42, 0.16)" stroke-width="1"></line>`;
+              seriesList.forEach((series) => {
+                const point = series.points[hoverIndex];
+                if (point.value === null || Number.isNaN(point.value)) return;
+                const y = toY(point.value);
+                hoverMarkup += `<circle cx="${x}" cy="${y}" r="4" fill="#ffffff" stroke="${series.color}" stroke-width="2"></circle>`;
+              });
+            }
+
+            chart.innerHTML = `
+              <rect x="0" y="0" width="${dimensions.width}" height="${dimensions.height}" rx="8" fill="#f8fafc"></rect>
+              ${gridLines}
+              ${lineMarkup}
+              ${hoverMarkup}
+              <text x="${dimensions.padLeft}" y="16" fill="#0f172a" font-size="12">${escapeHtml(config.formatValue(max, payload))}</text>
+              <text x="${dimensions.padLeft}" y="${dimensions.height - 12}" fill="#64748b" font-size="12">${escapeHtml(firstDate)}</text>
+              <text x="${dimensions.padLeft}" y="${dimensions.height - 28}" fill="#64748b" font-size="12">${escapeHtml(config.formatValue(min, payload))}</text>
+              <text x="${dimensions.width - dimensions.padRight}" y="${dimensions.height - 12}" fill="#64748b" font-size="12" text-anchor="end">${escapeHtml(lastDate)}</text>
+            `;
+          }
+
+          function hoverFromEvent(event) {
+            const { seriesList } = getWindowedPoints();
+            const count = seriesList[0]?.points.length || 0;
+            if (!count) return null;
+            const rect = chart.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+            const plotWidth = rect.width - dimensions.padLeft - dimensions.padRight;
+            const ratio = Math.min(1, Math.max(0, (x - dimensions.padLeft) / Math.max(1, plotWidth)));
+            return Math.round(ratio * Math.max(0, count - 1));
+          }
+
+          function updateTooltip(event, index) {
+            const { payload, seriesList } = getWindowedPoints();
+            if (!seriesList.length || index === null) {
+              tooltip.hidden = true;
+              return;
+            }
+            const date = seriesList[0].points[index]?.date;
+            const rows = seriesList.map((series) => {
+              const point = series.points[index];
+              const formatted = point.value === null || Number.isNaN(point.value) ? "--" : config.formatValue(point.value, payload);
+              return `<div class="tooltip-row"><span class="dot" style="background:${series.color}"></span><strong>${series.label}</strong><span>${formatted}</span></div>`;
+            }).join("");
+            tooltip.innerHTML = `<div class="tooltip-date">${date}</div>${rows}`;
+            const rect = chart.getBoundingClientRect();
+            tooltip.hidden = false;
+            tooltip.style.left = `${Math.min(rect.width - 240, event.clientX - rect.left + 14)}px`;
+            tooltip.style.top = `${Math.min(rect.height - 90, event.clientY - rect.top + 14)}px`;
+          }
+
+          function zoom(deltaY, anchorIndex) {
+            const currentSize = sharedState.end - sharedState.start + 1;
+            if (totalPoints <= 2) return;
+            const factor = deltaY > 0 ? 1.18 : 0.84;
+            let nextSize = Math.round(currentSize * factor);
+            nextSize = Math.max(8, Math.min(totalPoints, nextSize));
+            const anchorRatio = currentSize > 1 ? anchorIndex / (currentSize - 1) : 0.5;
+            let nextStart = Math.round(sharedState.start + (currentSize - nextSize) * anchorRatio);
+            const nextWindow = clampWindow(nextStart, nextStart + nextSize - 1);
+            sharedState.start = nextWindow.start;
+            sharedState.end = nextWindow.end;
+            renderAll();
+          }
+
+          toggles.forEach((button) => {
+            button.addEventListener("click", () => {
+              const key = button.dataset[config.toggleDataKey];
+              state.visible[key] = !state.visible[key];
+              button.classList.toggle("active", state.visible[key]);
+              draw();
+            });
+          });
+
+          zoomButtons.forEach((button) => {
+            button.addEventListener("click", () => {
+              const mode = button.dataset[config.zoomDataKey];
+              if (mode === "reset") {
+                resetWindow();
+                return;
+              }
+              zoom(mode === "in" ? -1 : 1, Math.round((sharedState.end - sharedState.start) / 2));
+            });
+          });
+
+          chart.addEventListener("mousemove", (event) => {
+            if (state.dragging) {
+              const rect = chart.getBoundingClientRect();
+              const windowSize = state.dragStartEnd - state.dragStartStart + 1;
+              const shiftRatio = (event.clientX - state.dragStartX) / Math.max(1, rect.width);
+              const shift = Math.round(shiftRatio * windowSize);
+              const nextWindow = clampWindow(state.dragStartStart - shift, state.dragStartStart - shift + windowSize - 1);
+              sharedState.start = nextWindow.start;
+              sharedState.end = nextWindow.end;
+              renderAll();
+              tooltip.hidden = true;
+              return;
+            }
+            const hoverIndex = hoverFromEvent(event);
+            draw(hoverIndex);
+            updateTooltip(event, hoverIndex);
+          });
+
+          chart.addEventListener("mouseleave", () => {
+            tooltip.hidden = true;
+            if (!state.dragging) draw();
+          });
+
+          chart.addEventListener("wheel", (event) => {
+            event.preventDefault();
+            const hoverIndex = hoverFromEvent(event);
+            zoom(event.deltaY, hoverIndex || 0);
+            updateTooltip(event, hoverIndex);
+          }, { passive: false });
+
+          chart.addEventListener("mousedown", (event) => {
+            state.dragging = true;
+            state.dragStartX = event.clientX;
+            state.dragStartStart = sharedState.start;
+            state.dragStartEnd = sharedState.end;
+          });
+
+          window.addEventListener("mouseup", () => {
+            state.dragging = false;
+          });
+
+          chart.addEventListener("dblclick", () => {
+            resetWindow();
+            tooltip.hidden = true;
+          });
+
+          controllers.push({ draw });
+          draw();
+        }
+
+        if (originDateInput) {
+          originDateInput.addEventListener("change", () => {
+            sharedState.manualOriginIndex = originDateInput.value ? findIndexForDate(originDateInput.value) : null;
+            if (!sharedState.followViewportOrigin) {
+              sharedState.start = typeof sharedState.manualOriginIndex === "number" ? sharedState.manualOriginIndex : 0;
+              sharedState.end = Math.max(sharedState.start, totalPoints - 1);
+            }
+            renderAll();
+          });
+        }
+
+        if (originFollowCheckbox) {
+          originFollowCheckbox.addEventListener("change", () => {
+            sharedState.followViewportOrigin = originFollowCheckbox.checked;
+            const nextWindow = clampWindow(sharedState.start, sharedState.end);
+            sharedState.start = nextWindow.start;
+            sharedState.end = nextWindow.end;
+            renderAll();
+          });
+        }
+
+        if (originResetButton) {
+          originResetButton.addEventListener("click", () => {
+            sharedState.manualOriginIndex = null;
+            sharedState.followViewportOrigin = false;
+            resetWindow();
+          });
+        }
+
+        if (rateBenchmarkSelect) {
+          rateBenchmarkSelect.addEventListener("change", async () => {
+            selectedRateBenchmark = rateBenchmarkSelect.value || "";
+            if (selectedRateBenchmark && !benchmarkSeriesCache[selectedRateBenchmark]) {
+              try {
+                const response = await fetch(`/api/benchmark-series?id=${encodeURIComponent(selectedRateBenchmark)}`);
+                if (!response.ok) {
+                  throw new Error(`HTTP ${response.status}`);
+                }
+                benchmarkSeriesCache[selectedRateBenchmark] = await response.json();
+              } catch (_error) {
+                selectedRateBenchmark = "";
+              }
+            }
+            renderAll();
+          });
+        }
+
+        initInteractiveChart({
+          kind: "money",
+          chartId: "trend-chart",
+          tooltipId: "trend-tooltip",
+          toggleSelector: "[data-series]",
+          toggleDataKey: "series",
+          zoomSelector: "[data-zoom]",
+          zoomDataKey: "zoom",
+          series: [
+            { key: "nav", payloadKey: "nav", label: "总资产", color: "#1d4ed8" },
+            { key: "contribution", payloadKey: "contribution", label: "本金 / 转账", color: "#0f766e" },
+            { key: "profit", payloadKey: "profit", label: "收益额", color: "#c2410c" },
+          ],
+          formatValue: (value, payload) => `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${payload.baseCurrency}`,
+        });
+
+        initInteractiveChart({
+          kind: "rate",
+          chartId: "rate-chart",
+          tooltipId: "rate-tooltip",
+          toggleSelector: "[data-rate-series]",
+          toggleDataKey: "rateSeries",
+          zoomSelector: "[data-rate-zoom]",
+          zoomDataKey: "rateZoom",
+          series: [
+            { key: "totalTwr", payloadKey: "totalTwr", label: "总市值 TWR", color: "#1d4ed8" },
+            { key: "effectiveTwr", payloadKey: "effectiveTwr", label: "有效投资额 TWR", color: "#0f766e" },
+            { key: "peakCostRate", payloadKey: "peakCostRate", label: "最大成本收益率", color: "#c2410c" },
+          ],
+          formatValue: (value) => `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`,
+        });
+
+        const calendarState = {
+          metric: "amount",
+          level: "year",
+          yearKey: "",
+          monthKey: "",
+          selectedDayKey: "",
+        };
+
+        function percentFromFactor(factor) {
+          return round((factor - 1) * 100, 4);
+        }
+
+        function factorFromCumulativePercent(percentValue) {
+          return 1 + ((percentValue || 0) / 100);
+        }
+
+        function buildCalendarDataset() {
+          const yearMap = new Map();
+          const allDays = [];
+          let previousProfit = null;
+          let previousFactor = null;
+
+          dates.forEach((dateKey, index) => {
+            const profitValue = rawMoneyPayload.profit?.[index]?.value || 0.0;
+            const totalFactor = factorFromCumulativePercent(rawRatePayload.totalTwr?.[index]?.value || 0.0);
+            const dailyProfit = previousProfit === null ? profitValue : profitValue - previousProfit;
+            const dailyFactor = previousFactor === null || Math.abs(previousFactor) < 1e-9 ? totalFactor : (totalFactor / previousFactor);
+            previousProfit = profitValue;
+            previousFactor = totalFactor;
+
+            const jsDate = new Date(`${dateKey}T00:00:00`);
+            const yearKey = `${jsDate.getFullYear()}`;
+            const monthIndex = jsDate.getMonth();
+            const monthKey = `${yearKey}-${String(monthIndex + 1).padStart(2, "0")}`;
+            const dayOfMonth = jsDate.getDate();
+            const weekdayIndex = (jsDate.getDay() + 6) % 7;
+            const dayRecord = {
+              date: dateKey,
+              yearKey,
+              monthKey,
+              monthIndex,
+              dayOfMonth,
+              weekdayIndex,
+              amount: round(dailyProfit, 2),
+              rateFactor: dailyFactor || 1.0,
+              rateValue: percentFromFactor(dailyFactor || 1.0),
+              cumulativeProfit: round(profitValue, 2),
+              cumulativeRate: round(rawRatePayload.totalTwr?.[index]?.value || 0.0, 4),
+            };
+            allDays.push(dayRecord);
+
+            if (!yearMap.has(yearKey)) {
+              yearMap.set(yearKey, {
+                key: yearKey,
+                label: `${yearKey}年`,
+                amount: 0.0,
+                rateFactor: 1.0,
+                months: new Map(),
+                days: [],
+              });
+            }
+            const yearBucket = yearMap.get(yearKey);
+            yearBucket.amount += dayRecord.amount;
+            yearBucket.rateFactor *= dayRecord.rateFactor;
+            yearBucket.days.push(dayRecord);
+
+            if (!yearBucket.months.has(monthKey)) {
+              yearBucket.months.set(monthKey, {
+                key: monthKey,
+                label: `${yearKey}年${String(monthIndex + 1).padStart(2, "0")}月`,
+                yearKey,
+                monthIndex,
+                amount: 0.0,
+                rateFactor: 1.0,
+                days: [],
+              });
+            }
+            const monthBucket = yearBucket.months.get(monthKey);
+            monthBucket.amount += dayRecord.amount;
+            monthBucket.rateFactor *= dayRecord.rateFactor;
+            monthBucket.days.push(dayRecord);
+          });
+
+          const years = Array.from(yearMap.values())
+            .sort((left, right) => left.key.localeCompare(right.key))
+            .map((yearBucket) => ({
+              ...yearBucket,
+              amount: round(yearBucket.amount, 2),
+              rateValue: percentFromFactor(yearBucket.rateFactor),
+              months: Array.from(yearBucket.months.values())
+                .sort((left, right) => left.key.localeCompare(right.key))
+                .map((monthBucket) => ({
+                  ...monthBucket,
+                  amount: round(monthBucket.amount, 2),
+                  rateValue: percentFromFactor(monthBucket.rateFactor),
+                })),
+            }));
+
+          return { years, allDays };
+        }
+
+        const calendarDataset = buildCalendarDataset();
+
+        function calendarMetricValue(item) {
+          return calendarState.metric === "rate" ? (item.rateValue || 0.0) : (item.amount || 0.0);
+        }
+
+        function formatCalendarMetric(value) {
+          if (calendarState.metric === "rate") {
+            return `${value.toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 0 })}%`;
+          }
+          return `${value.toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 0 })} ${rawMoneyPayload.baseCurrency}`;
+        }
+
+        function metricLabel() {
+          return calendarState.metric === "rate" ? "收益率" : "收益额";
+        }
+
+        function colorStyleFor(value, maxAbs) {
+          if (!maxAbs || Math.abs(value) < 1e-9) {
+            return "background: rgba(148, 163, 184, 0.08); border-color: rgba(148, 163, 184, 0.18);";
+          }
+          const strength = Math.max(0.14, Math.min(0.92, Math.abs(value) / maxAbs));
+          if (value > 0) {
+            return `background: rgba(22, 101, 52, ${0.08 + strength * 0.34}); border-color: rgba(22, 101, 52, ${0.18 + strength * 0.3}); color: #14532d;`;
+          }
+          return `background: rgba(185, 28, 28, ${0.08 + strength * 0.34}); border-color: rgba(185, 28, 28, ${0.18 + strength * 0.3}); color: #7f1d1d;`;
+        }
+
+        function currentYearBucket() {
+          return calendarDataset.years.find((year) => year.key === calendarState.yearKey) || null;
+        }
+
+        function currentMonthBucket() {
+          const yearBucket = currentYearBucket();
+          return yearBucket?.months.find((month) => month.key === calendarState.monthKey) || null;
+        }
+
+        function dailySummary(days) {
+          const positive = days.filter((day) => calendarMetricValue(day) > 0);
+          const negative = days.filter((day) => calendarMetricValue(day) < 0);
+          const sorted = [...days].sort((left, right) => calendarMetricValue(right) - calendarMetricValue(left));
+          return {
+            positiveCount: positive.length,
+            negativeCount: negative.length,
+            bestDay: sorted[0] || null,
+            worstDay: sorted[sorted.length - 1] || null,
+          };
+        }
+
+        function renderCalendarBreadcrumb() {
+          if (!calendarBreadcrumb) return;
+          const parts = [
+            { label: "全部年份", level: "year", yearKey: "", monthKey: "" },
+          ];
+          if (calendarState.yearKey) {
+            parts.push({ label: `${calendarState.yearKey}年`, level: "month", yearKey: calendarState.yearKey, monthKey: "" });
+          }
+          if (calendarState.monthKey) {
+            const monthBucket = currentMonthBucket();
+            parts.push({ label: monthBucket?.label || calendarState.monthKey, level: "day", yearKey: calendarState.yearKey, monthKey: calendarState.monthKey });
+          }
+          calendarBreadcrumb.innerHTML = parts.map((part, index) => `
+            <button
+              type="button"
+              class="breadcrumb-button ${index === parts.length - 1 ? "active" : ""}"
+              data-calendar-level="${part.level}"
+              data-calendar-year="${part.yearKey}"
+              data-calendar-month="${part.monthKey}"
+            >${escapeHtml(part.label)}</button>
+          `).join("<span class=\"breadcrumb-sep\">/</span>");
+          Array.from(calendarBreadcrumb.querySelectorAll("[data-calendar-level]")).forEach((button) => {
+            button.addEventListener("click", () => {
+              calendarState.level = button.dataset.calendarLevel || "year";
+              calendarState.yearKey = button.dataset.calendarYear || "";
+              calendarState.monthKey = button.dataset.calendarMonth || "";
+              calendarState.selectedDayKey = "";
+              renderCalendar();
+            });
+          });
+        }
+
+        function renderCalendarSummary(content) {
+          if (calendarSummary) {
+            calendarSummary.innerHTML = content;
+          }
+        }
+
+        function renderCalendarDetail(content) {
+          if (calendarDetail) {
+            calendarDetail.innerHTML = content;
+          }
+        }
+
+        function renderYearView() {
+          if (!calendarGrid) return;
+          const values = calendarDataset.years.map((item) => Math.abs(calendarMetricValue(item)));
+          const maxAbs = Math.max(...values, 0);
+          const totalAmount = round(calendarDataset.years.reduce((sum, item) => sum + item.amount, 0.0), 2);
+          const totalFactor = calendarDataset.years.reduce((running, item) => running * item.rateFactor, 1.0);
+          renderCalendarSummary(`
+            <strong>全区间${metricLabel()}</strong>
+            <span>${escapeHtml(formatCalendarMetric(calendarState.metric === "rate" ? percentFromFactor(totalFactor) : totalAmount))}</span>
+            <em>${calendarDataset.years.length} 个年度</em>
+          `);
+
+          calendarGrid.className = "calendar-grid-view year-grid";
+          calendarGrid.innerHTML = calendarDataset.years.map((yearBucket) => {
+            const miniMax = Math.max(...yearBucket.months.map((month) => Math.abs(calendarMetricValue(month))), 0);
+            const miniCells = yearBucket.months.map((month) => `
+              <span class="mini-cell" style="${colorStyleFor(calendarMetricValue(month), miniMax)}" title="${escapeHtml(`${month.label} · ${formatCalendarMetric(calendarMetricValue(month))}`)}"></span>
+            `).join("");
+            return `
+              <button type="button" class="calendar-card year-card" data-year-open="${yearBucket.key}" style="${colorStyleFor(calendarMetricValue(yearBucket), maxAbs)}">
+                <span class="calendar-card-kicker">${escapeHtml(yearBucket.label)}</span>
+                <strong>${escapeHtml(formatCalendarMetric(calendarMetricValue(yearBucket)))}</strong>
+                <em>${yearBucket.months.length} 个月</em>
+                <div class="calendar-mini-grid">${miniCells}</div>
+              </button>
+            `;
+          }).join("");
+
+          Array.from(calendarGrid.querySelectorAll("[data-year-open]")).forEach((button) => {
+            button.addEventListener("click", () => {
+              calendarState.level = "month";
+              calendarState.yearKey = button.dataset.yearOpen || "";
+              calendarState.monthKey = "";
+              calendarState.selectedDayKey = "";
+              renderCalendar();
+            });
+          });
+
+          const summary = dailySummary(calendarDataset.allDays);
+          renderCalendarDetail(`
+            <div class="calendar-detail-head">
+              <h3>全区间概览</h3>
+              <span>${calendarDataset.allDays[0]?.date || "--"} 到 ${calendarDataset.allDays.at(-1)?.date || "--"}</span>
+            </div>
+            <dl class="calendar-detail-list">
+              <div><dt>累计收益额</dt><dd>${escapeHtml(formatCalendarMetric(totalAmount))}</dd></div>
+              <div><dt>累计收益率</dt><dd>${escapeHtml(`${percentFromFactor(totalFactor).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`)}</dd></div>
+              <div><dt>盈利天数</dt><dd>${summary.positiveCount}</dd></div>
+              <div><dt>回撤天数</dt><dd>${summary.negativeCount}</dd></div>
+              <div><dt>最好的一天</dt><dd>${summary.bestDay ? `${summary.bestDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.bestDay))}` : "--"}</dd></div>
+              <div><dt>最差的一天</dt><dd>${summary.worstDay ? `${summary.worstDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.worstDay))}` : "--"}</dd></div>
+            </dl>
+          `);
+        }
+
+        function renderMonthView() {
+          if (!calendarGrid) return;
+          const yearBucket = currentYearBucket();
+          if (!yearBucket) {
+            calendarState.level = "year";
+            renderYearView();
+            return;
+          }
+          const values = yearBucket.months.map((item) => Math.abs(calendarMetricValue(item)));
+          const maxAbs = Math.max(...values, 0);
+          renderCalendarSummary(`
+            <strong>${escapeHtml(yearBucket.label)}${metricLabel()}</strong>
+            <span>${escapeHtml(formatCalendarMetric(calendarMetricValue(yearBucket)))}</span>
+            <em>${yearBucket.months.length} 个月</em>
+          `);
+          calendarGrid.className = "calendar-grid-view month-grid";
+          calendarGrid.innerHTML = yearBucket.months.map((monthBucket) => {
+            const preview = monthBucket.days.slice(0, 31).map((day) => `
+              <span class="mini-cell" style="${colorStyleFor(calendarMetricValue(day), Math.max(...monthBucket.days.map((item) => Math.abs(calendarMetricValue(item))), 0))}"></span>
+            `).join("");
+            return `
+              <button type="button" class="calendar-card month-card" data-month-open="${monthBucket.key}" style="${colorStyleFor(calendarMetricValue(monthBucket), maxAbs)}">
+                <span class="calendar-card-kicker">${escapeHtml(monthBucket.label)}</span>
+                <strong>${escapeHtml(formatCalendarMetric(calendarMetricValue(monthBucket)))}</strong>
+                <em>${monthBucket.days.length} 天</em>
+                <div class="calendar-mini-grid month-preview">${preview}</div>
+              </button>
+            `;
+          }).join("");
+
+          Array.from(calendarGrid.querySelectorAll("[data-month-open]")).forEach((button) => {
+            button.addEventListener("click", () => {
+              calendarState.level = "day";
+              calendarState.monthKey = button.dataset.monthOpen || "";
+              calendarState.selectedDayKey = "";
+              renderCalendar();
+            });
+          });
+
+          const summary = dailySummary(yearBucket.days);
+          renderCalendarDetail(`
+            <div class="calendar-detail-head">
+              <h3>${escapeHtml(yearBucket.label)}</h3>
+              <span>按月份钻取</span>
+            </div>
+            <dl class="calendar-detail-list">
+              <div><dt>年度收益额</dt><dd>${escapeHtml(`${yearBucket.amount.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${rawMoneyPayload.baseCurrency}`)}</dd></div>
+              <div><dt>年度收益率</dt><dd>${escapeHtml(`${yearBucket.rateValue.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`)}</dd></div>
+              <div><dt>最好的一天</dt><dd>${summary.bestDay ? `${summary.bestDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.bestDay))}` : "--"}</dd></div>
+              <div><dt>最差的一天</dt><dd>${summary.worstDay ? `${summary.worstDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.worstDay))}` : "--"}</dd></div>
+            </dl>
+          `);
+        }
+
+        function renderDayView() {
+          if (!calendarGrid) return;
+          const monthBucket = currentMonthBucket();
+          if (!monthBucket) {
+            calendarState.level = "month";
+            renderMonthView();
+            return;
+          }
+          const values = monthBucket.days.map((item) => Math.abs(calendarMetricValue(item)));
+          const maxAbs = Math.max(...values, 0);
+          const firstDay = monthBucket.days[0];
+          const leadingBlanks = firstDay ? firstDay.weekdayIndex : 0;
+          const slots = [];
+          for (let blankIndex = 0; blankIndex < leadingBlanks; blankIndex += 1) {
+            slots.push(`<div class="calendar-day empty"></div>`);
+          }
+          monthBucket.days.forEach((day) => {
+            slots.push(`
+              <button
+                type="button"
+                class="calendar-day ${calendarState.selectedDayKey === day.date ? "selected" : ""}"
+                data-day-open="${day.date}"
+                style="${colorStyleFor(calendarMetricValue(day), maxAbs)}"
+              >
+                <span class="calendar-day-number">${day.dayOfMonth}</span>
+                <span class="calendar-day-value">${escapeHtml(formatCalendarMetric(calendarMetricValue(day)))}</span>
+              </button>
+            `);
+          });
+
+          renderCalendarSummary(`
+            <strong>${escapeHtml(monthBucket.label)}${metricLabel()}</strong>
+            <span>${escapeHtml(formatCalendarMetric(calendarMetricValue(monthBucket)))}</span>
+            <em>${monthBucket.days.length} 天</em>
+          `);
+
+          calendarGrid.className = "calendar-grid-view day-grid";
+          calendarGrid.innerHTML = `
+            <div class="calendar-weekdays">
+              <span>周一</span><span>周二</span><span>周三</span><span>周四</span><span>周五</span><span>周六</span><span>周日</span>
+            </div>
+            <div class="calendar-day-grid">${slots.join("")}</div>
+          `;
+
+          Array.from(calendarGrid.querySelectorAll("[data-day-open]")).forEach((button) => {
+            button.addEventListener("click", () => {
+              calendarState.selectedDayKey = button.dataset.dayOpen || "";
+              renderDayView();
+            });
+          });
+
+          const selectedDay = monthBucket.days.find((day) => day.date === calendarState.selectedDayKey) || null;
+          const summary = dailySummary(monthBucket.days);
+          if (selectedDay) {
+            renderCalendarDetail(`
+              <div class="calendar-detail-head">
+                <h3>${escapeHtml(selectedDay.date)}</h3>
+                <span>${escapeHtml(monthBucket.label)}</span>
+              </div>
+              <dl class="calendar-detail-list">
+                <div><dt>当日收益额</dt><dd>${escapeHtml(`${selectedDay.amount.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${rawMoneyPayload.baseCurrency}`)}</dd></div>
+                <div><dt>当日收益率</dt><dd>${escapeHtml(`${selectedDay.rateValue.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`)}</dd></div>
+                <div><dt>累计收益额</dt><dd>${escapeHtml(`${selectedDay.cumulativeProfit.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${rawMoneyPayload.baseCurrency}`)}</dd></div>
+                <div><dt>累计总市值 TWR</dt><dd>${escapeHtml(`${selectedDay.cumulativeRate.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`)}</dd></div>
+              </dl>
+            `);
+          } else {
+            renderCalendarDetail(`
+              <div class="calendar-detail-head">
+                <h3>${escapeHtml(monthBucket.label)}</h3>
+                <span>点某一天看细节</span>
+              </div>
+              <dl class="calendar-detail-list">
+                <div><dt>月度收益额</dt><dd>${escapeHtml(`${monthBucket.amount.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${rawMoneyPayload.baseCurrency}`)}</dd></div>
+                <div><dt>月度收益率</dt><dd>${escapeHtml(`${monthBucket.rateValue.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`)}</dd></div>
+                <div><dt>最好的一天</dt><dd>${summary.bestDay ? `${summary.bestDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.bestDay))}` : "--"}</dd></div>
+                <div><dt>最差的一天</dt><dd>${summary.worstDay ? `${summary.worstDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.worstDay))}` : "--"}</dd></div>
+              </dl>
+            `);
+          }
+        }
+
+        function renderCalendar() {
+          if (!calendarGrid || !calendarSummary || !calendarDetail || !calendarBreadcrumb) return;
+          calendarMetricButtons.forEach((button) => {
+            button.classList.toggle("active", button.dataset.calendarMetric === calendarState.metric);
+          });
+          renderCalendarBreadcrumb();
+          if (calendarState.level === "year") {
+            renderYearView();
+            return;
+          }
+          if (calendarState.level === "month") {
+            renderMonthView();
+            return;
+          }
+          renderDayView();
+        }
+
+        calendarMetricButtons.forEach((button) => {
+          button.addEventListener("click", () => {
+            calendarState.metric = button.dataset.calendarMetric || "amount";
+            renderCalendar();
+          });
+        });
+
+        refreshOriginUi();
+        renderAll();
+      })();
+    </script>
+  </body>
+</html>

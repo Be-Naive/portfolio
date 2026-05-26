@@ -1,0 +1,9 @@
+instrument_id,broker,symbol,date,close,currency
+ibkr:766489657,ibkr,ALLW,,,USD
+ibkr:43645865,ibkr,IBKR,,,USD
+ibkr:4815747,ibkr,NVDA,,,USD
+ibkr:449738108,ibkr,QQQM,,,USD
+gtja:004475,gtja,004475,,,CNY
+gtja:511130,gtja,511130,,,CNY
+gtja:518800,gtja,518800,,,CNY
+gtja:952100,gtja,952100,,,CNY
