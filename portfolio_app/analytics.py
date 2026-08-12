@@ -100,9 +100,14 @@ def build_dashboard(connection, base_currency: str = "CNY") -> Dict[str, object]
         )
     timeseries["profit"] = profit_series
 
-    total_market_value = sum(item["market_value_base"] for item in products) + cash_totals["base_total"]
+    holdings_market_value = sum(item["market_value_base"] for item in products) + cash_totals["base_total"]
+    total_market_value = (
+        timeseries["nav"][-1]["value"]
+        if timeseries["nav"]
+        else round(holdings_market_value, 2)
+    )
     net_contribution = timeseries["net_contribution"][-1]["value"] if timeseries["net_contribution"] else 0.0
-    total_return = total_market_value - net_contribution
+    total_return = timeseries["profit"][-1]["value"] if timeseries["profit"] else total_market_value - net_contribution
     allocation = _allocation(products, cash_totals, base_currency, fx_pairs)
     product_views = _decorate_products(products, total_market_value)
     transactions_view = _decorate_transactions(transactions)
@@ -461,7 +466,8 @@ def _product_analysis(holdings, price_map, fx_pairs, base_currency):
         quantity = bucket["quantity"]
         if quantity <= 0 and abs(bucket["realized_pnl"]) < 0.01:
             continue
-        price, price_currency = price_map.get(instrument_id, (bucket.get("market_price", 0.0), bucket["currency"]))
+        market_price = price_map.get(instrument_id)
+        price, price_currency = market_price or (bucket.get("market_price", 0.0), bucket["currency"])
         unit_multiplier = 100.0 if bucket["asset_class"] == "option" else 1.0
         if bucket["asset_class"] == "repo":
             price = 1.0
@@ -471,12 +477,17 @@ def _product_analysis(holdings, price_map, fx_pairs, base_currency):
             price_currency = bucket["currency"]
         native_currency = price_currency or bucket["currency"]
         fx_rate = _resolve_fx_rate(native_currency, base_currency, fx_pairs)
-        market_value = bucket.get("market_value") or quantity * price * unit_multiplier
+        use_live_valuation = market_price is not None or bucket["asset_class"] in {"repo", "cash_management"}
+        market_value = (
+            quantity * price * unit_multiplier
+            if use_live_valuation
+            else bucket.get("market_value") or quantity * price * unit_multiplier
+        )
         market_value_base = market_value * fx_rate
         unrealized = bucket.get("unrealized_pnl")
         if quantity <= 0:
             unrealized = 0.0
-        elif unrealized in (None, 0.0):
+        elif use_live_valuation or unrealized in (None, 0.0):
             unrealized = market_value - bucket["cost_basis_total"]
         realized_native = bucket["realized_pnl"]
         unrealized_native = unrealized

@@ -3,6 +3,7 @@ import sqlite3
 import unittest
 from datetime import date, timedelta
 
+from portfolio_app import db
 from portfolio_app.analytics import (
     _build_timeseries,
     _benchmark_catalog,
@@ -17,12 +18,57 @@ from portfolio_app.analytics import (
     _enrich_fund_flow_row,
     _resolve_fx_rate,
     _transaction_effect,
+    build_dashboard,
     parse_rebalance_targets,
     suggest_rebalance,
 )
 
 
 class AnalyticsTest(unittest.TestCase):
+    def test_dashboard_headline_matches_timeseries_endpoint(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(db.SCHEMA)
+        today = date.today().isoformat()
+        connection.execute(
+            """
+            INSERT INTO accounts (id, broker, account_code, display_name, base_currency)
+            VALUES ('account', 'test', 'account', 'Test account', 'CNY')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO instruments (id, broker, symbol, name, asset_class, market, currency)
+            VALUES ('test:asset', 'test', 'ASSET', 'Asset', 'equity', 'CN', 'CNY')
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO transactions (
+                id, broker, account_id, instrument_id, settle_date, trade_date,
+                activity_type, description, external_flow, quantity, price,
+                gross_amount, cash_amount, currency
+            ) VALUES (?, 'test', 'account', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CNY')
+            """,
+            [
+                ("flow", None, today, today, "bank_transfer_in", "Deposit", 1, None, None, None, 1000.0),
+                ("buy", "test:asset", today, today, "security_buy", "Buy", 0, 3.0, 100.0, 300.0, -300.0),
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO price_history (instrument_id, price_date, close_price, currency, source)
+            VALUES ('test:asset', ?, 101.005, 'CNY', 'manual_csv')
+            """,
+            (today,),
+        )
+
+        dashboard = build_dashboard(connection)
+
+        self.assertEqual(dashboard["summary"]["total_market_value"], dashboard["timeseries"]["nav"][-1]["value"])
+        self.assertEqual(dashboard["summary"]["total_return"], dashboard["timeseries"]["profit"][-1]["value"])
+        connection.close()
+
     def test_empty_timeseries_preserves_chart_series_shape(self):
         self.assertEqual(
             _build_timeseries([], [], [], "CNY"),
@@ -227,6 +273,38 @@ class AnalyticsTest(unittest.TestCase):
         self.assertEqual(product["unrealized_pnl_base"], 720.0)
         self.assertEqual(product["total_return"], 300.0)
         self.assertEqual(product["total_return_base"], 2160.0)
+
+    def test_product_analysis_revalues_snapshot_with_latest_market_price(self):
+        holdings = {
+            "ibkr:qqqm": {
+                "instrument_id": "ibkr:qqqm",
+                "symbol": "QQQM",
+                "name": "QQQM",
+                "asset_class": "security",
+                "market": "NASDAQ",
+                "currency": "USD",
+                "quantity": 10.0,
+                "average_cost": 100.0,
+                "cost_basis_total": 1000.0,
+                "realized_pnl": 0.0,
+                "account_name": "ibkr",
+                "market_price": 110.0,
+                "market_value": 1100.0,
+                "unrealized_pnl": 100.0,
+            }
+        }
+
+        product = _product_analysis(
+            holdings,
+            {"ibkr:qqqm": (115.0, "USD")},
+            {("USD", "CNY"): 7.2},
+            "CNY",
+        )[0]
+
+        self.assertEqual(product["price"], 115.0)
+        self.assertEqual(product["market_value"], 1150.0)
+        self.assertEqual(product["market_value_base"], 8280.0)
+        self.assertEqual(product["unrealized_pnl"], 150.0)
 
     def test_cash_effects_for_fx_conversion(self):
         row = {
