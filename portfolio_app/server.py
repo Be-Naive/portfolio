@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from email.parser import BytesParser
+from email.policy import default as email_policy
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +25,7 @@ DEFAULT_SAMPLE_PDF = Path(
 DEFAULT_SAMPLE_XML = Path("/Users/bytedance/Downloads/portfolio_performance (1).xml")
 AUTO_MARKET_REFRESH_INTERVAL = timedelta(minutes=15)
 MARKET_SYNC_SOURCES = ("market_data_auto", "market_data_manual")
+MAX_BACKUP_UPLOAD_BYTES = 256 * 1024 * 1024
 
 
 class PortfolioApplication:
@@ -43,6 +47,8 @@ class PortfolioApplication:
                 return self._static_css(start_response)
             if method == "GET" and path == "/api/benchmark-series":
                 return self._api_benchmark_series(environ, start_response)
+            if method == "GET" and path == "/actions/export-database":
+                return self._export_database(start_response)
             if method == "POST" and path == "/actions/import-gtja":
                 return self._import_gtja(environ, start_response)
             if method == "POST" and path == "/actions/sync-ibkr":
@@ -53,6 +59,8 @@ class PortfolioApplication:
                 return self._refresh_market_data(environ, start_response)
             if method == "POST" and path == "/actions/rebalance":
                 return self._rebalance(environ, start_response)
+            if method == "POST" and path == "/actions/import-database":
+                return self._import_database(environ, start_response)
             if method == "GET" and path == "/api/dashboard":
                 return self._api_dashboard(start_response)
             return self._respond(start_response, "404 Not Found", "Not found", "text/plain")
@@ -101,6 +109,61 @@ class PortfolioApplication:
     def _static_css(self, start_response):
         css = STATIC_DIR.joinpath("style.css").read_text(encoding="utf-8")
         return self._respond(start_response, "200 OK", css, "text/css; charset=utf-8")
+
+    def _export_database(self, start_response):
+        export_name = f"portfolio-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            export_path = Path(temp_dir) / export_name
+            db.backup_database(self.db_path, export_path)
+            payload = export_path.read_bytes()
+        return self._respond_bytes(
+            start_response,
+            "200 OK",
+            payload,
+            "application/vnd.sqlite3",
+            [
+                ("Content-Disposition", f'attachment; filename="{export_name}"'),
+                ("Cache-Control", "no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+        )
+
+    def _import_database(self, environ, start_response):
+        try:
+            fields, files = self._parse_multipart_form(environ)
+            if fields.get("confirm_restore") != "1":
+                raise ValueError("Confirm that the current ledger may be replaced before restoring.")
+            uploaded = files.get("database_file")
+            if not uploaded:
+                raise ValueError("Select a portfolio database backup to restore.")
+            filename, payload = uploaded
+            if not payload:
+                raise ValueError("The selected database backup is empty.")
+
+            rollback_dir = self.db_path.parent / "backups" / "database"
+            rollback_name = (
+                f"portfolio-before-dashboard-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                f"-{uuid.uuid4().hex[:8]}.db"
+            )
+            rollback_path = rollback_dir / rollback_name
+            with tempfile.TemporaryDirectory() as temp_dir:
+                upload_path = Path(temp_dir) / "portfolio-upload.db"
+                upload_path.write_bytes(payload)
+                restored = db.restore_database(upload_path, self.db_path, rollback_path)
+        except ValueError as exc:
+            return self._render_dashboard(
+                start_response,
+                status="400 Bad Request",
+                error=str(exc),
+            )
+
+        return self._render_dashboard(
+            start_response,
+            message=(
+                f"Restored {restored['transactions']} transactions from {filename}. "
+                f"Previous ledger saved as {rollback_name}."
+            ),
+        )
 
     def _import_gtja(self, environ, start_response):
         form = self._parse_form(environ)
@@ -296,6 +359,7 @@ class PortfolioApplication:
                 "nav": dashboard["timeseries"]["nav"],
                 "contribution": dashboard["timeseries"]["net_contribution"],
                 "profit": dashboard["timeseries"]["profit"],
+                "productProfitBreakdown": dashboard["timeseries"]["product_profit_breakdown"],
                 "baseCurrency": dashboard["summary"]["base_currency"],
             },
             ensure_ascii=False,
@@ -478,6 +542,43 @@ class PortfolioApplication:
         return parse_qs(raw)
 
     @staticmethod
+    def _parse_multipart_form(environ):
+        content_type = environ.get("CONTENT_TYPE", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            raise ValueError("Database restore requires a multipart file upload.")
+        size = int(environ.get("CONTENT_LENGTH") or 0)
+        if size <= 0:
+            raise ValueError("The database upload is empty.")
+        if size > MAX_BACKUP_UPLOAD_BYTES:
+            raise ValueError("Database backup exceeds the 256 MB upload limit.")
+        raw = environ["wsgi.input"].read(size)
+        message = BytesParser(policy=email_policy).parsebytes(
+            b"Content-Type: "
+            + content_type.encode("ascii")
+            + b"\r\nMIME-Version: 1.0\r\n\r\n"
+            + raw
+        )
+        if not message.is_multipart():
+            raise ValueError("Unable to parse the database upload.")
+
+        fields: Dict[str, str] = {}
+        files: Dict[str, tuple[str, bytes]] = {}
+        for part in message.iter_parts():
+            if part.get_content_disposition() != "form-data":
+                continue
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            filename = part.get_filename()
+            if filename is not None:
+                files[name] = (Path(filename).name, payload)
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            fields[name] = payload.decode(charset)
+        return fields, files
+
+    @staticmethod
     def _select_rebalance_items(items: list[Dict[str, object]], selected_labels: list[str]) -> list[Dict[str, object]]:
         if not selected_labels:
             return items
@@ -487,11 +588,16 @@ class PortfolioApplication:
     @staticmethod
     def _respond(start_response, status: str, body: str, content_type: str):
         payload = body.encode("utf-8")
+        return PortfolioApplication._respond_bytes(start_response, status, payload, content_type)
+
+    @staticmethod
+    def _respond_bytes(start_response, status: str, payload: bytes, content_type: str, extra_headers=None):
         start_response(
             status,
             [
                 ("Content-Type", content_type),
                 ("Content-Length", str(len(payload))),
+                *(extra_headers or []),
             ],
         )
         return [payload]

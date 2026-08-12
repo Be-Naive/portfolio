@@ -9,5 +9,6 @@ venv/
 env/
 
 data/portfolio.db
+data/backups/
 tmp/
 *.log

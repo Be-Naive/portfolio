@@ -254,8 +254,14 @@ def parse_flex_statement_xml(xml_text: str) -> FlexStatementData:
             for node in cash_nodes
             if (_attr(node, "levelOfDetail") or "").upper() == "DETAIL"
         }
+        detail_cash_totals = {}
+        for node in cash_nodes:
+            if (_attr(node, "levelOfDetail") or "").upper() != "DETAIL":
+                continue
+            group = _cash_transaction_group_signature(node)
+            detail_cash_totals[group] = detail_cash_totals.get(group, 0.0) + _floatish(_attr(node, "amount"))
         for cash_tx in cash_nodes:
-            if _should_skip_summary_cash_transaction(cash_tx, detail_cash_signatures):
+            if _should_skip_summary_cash_transaction(cash_tx, detail_cash_signatures, detail_cash_totals):
                 continue
             payload = _parse_cash_transaction(cash_tx, default_account_id, default_currency, known_instrument_ids_by_symbol)
             if payload:
@@ -291,7 +297,14 @@ def parse_flex_statement_xml(xml_text: str) -> FlexStatementData:
             if section is None:
                 continue
             found_cash_report = True
-            for node in list(section):
+            cash_report_nodes = list(section)
+            has_currency_detail = any(
+                (_attr(node, "levelOfDetail") or "").upper() == "CURRENCY"
+                for node in cash_report_nodes
+            )
+            for node in cash_report_nodes:
+                if has_currency_detail and (_attr(node, "levelOfDetail") or "").upper() == "BASECURRENCY":
+                    continue
                 payload = _parse_cash_balance(node, default_account_id, default_currency)
                 if payload:
                     cash_balances.append(payload)
@@ -592,7 +605,12 @@ def _parse_corporate_action(
 
 
 def _parse_cash_balance(node: ET.Element, account_id: str, default_currency: str):
-    currency = _normalize_currency(_attr(node, "currency") or default_currency)
+    level_of_detail = (_attr(node, "levelOfDetail") or "").upper()
+    currency = _normalize_currency(
+        default_currency
+        if level_of_detail == "BASECURRENCY"
+        else (_attr(node, "currency") or default_currency)
+    )
     amount = (
         _floatish(_attr(node, "endingCash"))
         or _floatish(_attr(node, "endingSettledCash"))
@@ -707,11 +725,24 @@ def _cash_transaction_signature(node: ET.Element):
     )
 
 
-def _should_skip_summary_cash_transaction(node: ET.Element, detail_signatures) -> bool:
+def _cash_transaction_group_signature(node: ET.Element):
     return (
-        (_attr(node, "levelOfDetail") or "").upper() == "SUMMARY"
-        and _cash_transaction_signature(node) in detail_signatures
+        _normalize_date(_attr(node, "dateTime") or _attr(node, "reportDate") or _attr(node, "settleDate")),
+        _normalize_currency(_attr(node, "currency")),
+        _attr(node, "type"),
+        _attr(node, "description"),
     )
+
+
+def _should_skip_summary_cash_transaction(node: ET.Element, detail_signatures, detail_totals) -> bool:
+    if (_attr(node, "levelOfDetail") or "").upper() != "SUMMARY":
+        return False
+    if _cash_transaction_signature(node) in detail_signatures:
+        return True
+    detail_total = detail_totals.get(_cash_transaction_group_signature(node))
+    if detail_total is None:
+        return False
+    return abs(detail_total - _floatish(_attr(node, "amount"))) < 0.01
 
 
 def _map_asset_class(raw: str) -> str:

@@ -9,6 +9,19 @@ from typing import Dict, Iterable, Iterator, List, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = ROOT / "data" / "portfolio.db"
+BACKUP_REQUIRED_TABLES = frozenset(
+    {
+        "accounts",
+        "instruments",
+        "transactions",
+        "cash_flows",
+        "price_history",
+        "fx_rates",
+        "position_snapshots",
+        "cash_balances",
+        "sync_runs",
+    }
+)
 
 
 SCHEMA = """
@@ -161,6 +174,84 @@ def open_db(db_path: Path = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
 def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
     with open_db(db_path) as connection:
         connection.executescript(SCHEMA)
+
+
+def backup_database(source_path: Path, destination_path: Path) -> Path:
+    source_path = Path(source_path)
+    destination_path = Path(destination_path)
+    if not source_path.is_file():
+        raise ValueError(f"Database not found: {source_path}")
+    if source_path.resolve() == destination_path.resolve():
+        raise ValueError("Backup destination must differ from the source database.")
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    source = sqlite3.connect(source_path)
+    destination = sqlite3.connect(destination_path)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    return destination_path
+
+
+def inspect_backup(backup_path: Path) -> Dict[str, object]:
+    backup_path = Path(backup_path)
+    if not backup_path.is_file():
+        raise ValueError("Select a database backup file to restore.")
+    with backup_path.open("rb") as stream:
+        if stream.read(16) != b"SQLite format 3\x00":
+            raise ValueError("The selected file is not a SQLite database backup.")
+
+    connection = sqlite3.connect(backup_path)
+    try:
+        connection.execute("PRAGMA trusted_schema = OFF")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise ValueError(f"Database integrity check failed: {integrity}")
+
+        schema_rows = connection.execute(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        tables = {name for object_type, name in schema_rows if object_type == "table"}
+        missing_tables = sorted(BACKUP_REQUIRED_TABLES - tables)
+        if missing_tables:
+            raise ValueError(f"Backup is missing required tables: {', '.join(missing_tables)}")
+
+        unsupported_objects = sorted(
+            name for object_type, name in schema_rows if object_type in {"trigger", "view"}
+        )
+        if unsupported_objects:
+            raise ValueError("Backup contains unsupported database objects.")
+
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise ValueError("Backup contains broken database relationships.")
+
+        return {
+            "transactions": connection.execute("SELECT COUNT(1) FROM transactions").fetchone()[0],
+            "accounts": connection.execute("SELECT COUNT(1) FROM accounts").fetchone()[0],
+            "instruments": connection.execute("SELECT COUNT(1) FROM instruments").fetchone()[0],
+        }
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"Unable to read database backup: {exc}") from exc
+    finally:
+        connection.close()
+
+
+def restore_database(source_path: Path, target_path: Path, rollback_path: Path) -> Dict[str, object]:
+    inspection = inspect_backup(source_path)
+    backup_database(target_path, rollback_path)
+    try:
+        backup_database(source_path, target_path)
+        init_db(target_path)
+        restored = inspect_backup(target_path)
+    except Exception:
+        backup_database(rollback_path, target_path)
+        raise
+    if restored != inspection:
+        backup_database(rollback_path, target_path)
+        raise ValueError("Restored database did not match the selected backup.")
+    return restored
 
 
 def upsert_account(connection: sqlite3.Connection, payload: Dict[str, object]) -> None:

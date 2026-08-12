@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from dataclasses import replace
 import unittest
@@ -12,13 +13,11 @@ from portfolio_app.gtja_pdf import (
 )
 
 
-SAMPLE = Path(
-    "/Users/bytedance/Library/Containers/com.tencent.xinWeChat/Data/Documents/"
-    "xwechat_files/wxid_5306923069012_3823/msg/file/2026-03/pdf_viewer_1774344494948.pdf"
-)
+SAMPLE = Path(os.environ.get("GTJA_SAMPLE_PDF", Path(__file__).parent / "fixtures" / "gtja_statement.pdf"))
 
 
 class GtjaPdfParserTest(unittest.TestCase):
+    @unittest.skipUnless(SAMPLE.is_file(), "Set GTJA_SAMPLE_PDF to run the private statement fixture test.")
     def test_parse_rows(self):
         rows = parse_gtja_statement(SAMPLE)
         self.assertGreater(len(rows), 10)

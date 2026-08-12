@@ -93,6 +93,44 @@
         </article>
       </section>
 
+      <section class="grid forms">
+        <article class="panel migration-panel">
+          <div class="panel-head">
+            <h2>账本迁移</h2>
+            <span>SQLite 数据库</span>
+          </div>
+          <dl class="migration-stats">
+            <div>
+              <dt>账户</dt>
+              <dd>{{ dashboard.accounts_count }}</dd>
+            </div>
+            <div>
+              <dt>流水</dt>
+              <dd>{{ dashboard.summary.imported_transactions }}</dd>
+            </div>
+            <div>
+              <dt>产品</dt>
+              <dd>{{ dashboard.summary.products }}</dd>
+            </div>
+          </dl>
+          <a class="button-link" href="/actions/export-database" download>导出账本备份</a>
+        </article>
+
+        <form method="post" action="/actions/import-database" enctype="multipart/form-data" class="panel migration-panel">
+          <div class="panel-head">
+            <h2>恢复账本</h2>
+            <span>替换当前数据库</span>
+          </div>
+          <label for="database_file">数据库备份</label>
+          <input id="database_file" name="database_file" type="file" accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3" required>
+          <label class="checkbox restore-confirmation">
+            <input name="confirm_restore" type="checkbox" value="1" required>
+            <span>已确认替换当前账本</span>
+          </label>
+          <button type="submit">恢复账本</button>
+        </form>
+      </section>
+
       <section class="grid summary">
         <article class="metric">
           <span>总资产净值</span>
@@ -324,6 +362,7 @@
           <h2>产品分析</h2>
           <span>主行按 {{ dashboard.summary.base_currency }} 折算，次行保留产品本币；收益折算使用当前汇率做横向比较</span>
         </div>
+        <div class="table-scroll">
         <table>
           <thead>
             <tr>
@@ -375,6 +414,7 @@
             {% endfor %}
           </tbody>
         </table>
+        </div>
       </section>
 
       <section class="panel">
@@ -382,6 +422,7 @@
           <h2>最近流水</h2>
           <span>最近 20 笔标准化交易记录</span>
         </div>
+        <div class="table-scroll">
         <table>
           <thead>
             <tr>
@@ -406,6 +447,7 @@
             {% endfor %}
           </tbody>
         </table>
+        </div>
       </section>
 
       <section class="panel footer-note">
@@ -987,16 +1029,39 @@
           return 1 + ((percentValue || 0) / 100);
         }
 
+        function aggregateProductBreakdown(days) {
+          const totals = new Map();
+          days.forEach((day) => {
+            (day.productBreakdown || []).forEach((item) => {
+              const key = item.instrument_id || `${item.kind || "other"}:${item.label || ""}`;
+              if (!totals.has(key)) {
+                totals.set(key, { ...item, value: 0.0 });
+              }
+              totals.get(key).value += Number(item.value) || 0.0;
+            });
+          });
+          return Array.from(totals.values())
+            .map((item) => ({ ...item, value: round(item.value, 2) }))
+            .filter((item) => Math.abs(item.value) >= 0.01)
+            .sort((left, right) => Math.abs(right.value) - Math.abs(left.value));
+        }
+
         function buildCalendarDataset() {
           const yearMap = new Map();
           const allDays = [];
+          const productBreakdownByDate = new Map(
+            (rawMoneyPayload.productProfitBreakdown || []).map((item) => [item.date, item]),
+          );
           let previousProfit = null;
           let previousFactor = null;
 
           dates.forEach((dateKey, index) => {
             const profitValue = rawMoneyPayload.profit?.[index]?.value || 0.0;
             const totalFactor = factorFromCumulativePercent(rawRatePayload.totalTwr?.[index]?.value || 0.0);
-            const dailyProfit = previousProfit === null ? profitValue : profitValue - previousProfit;
+            const productBreakdown = productBreakdownByDate.get(dateKey) || null;
+            const dailyProfit = productBreakdown
+              ? (productBreakdown.total || 0.0)
+              : (previousProfit === null ? profitValue : profitValue - previousProfit);
             const dailyFactor = previousFactor === null || Math.abs(previousFactor) < 1e-9 ? totalFactor : (totalFactor / previousFactor);
             previousProfit = profitValue;
             previousFactor = totalFactor;
@@ -1019,6 +1084,7 @@
               rateValue: percentFromFactor(dailyFactor || 1.0),
               cumulativeProfit: round(profitValue, 2),
               cumulativeRate: round(rawRatePayload.totalTwr?.[index]?.value || 0.0, 4),
+              productBreakdown: productBreakdown?.items || [],
             };
             allDays.push(dayRecord);
 
@@ -1060,16 +1126,18 @@
               ...yearBucket,
               amount: round(yearBucket.amount, 2),
               rateValue: percentFromFactor(yearBucket.rateFactor),
+              productBreakdown: aggregateProductBreakdown(yearBucket.days),
               months: Array.from(yearBucket.months.values())
                 .sort((left, right) => left.key.localeCompare(right.key))
                 .map((monthBucket) => ({
                   ...monthBucket,
                   amount: round(monthBucket.amount, 2),
                   rateValue: percentFromFactor(monthBucket.rateFactor),
+                  productBreakdown: aggregateProductBreakdown(monthBucket.days),
                 })),
             }));
 
-          return { years, allDays };
+          return { years, allDays, productBreakdown: aggregateProductBreakdown(allDays) };
         }
 
         const calendarDataset = buildCalendarDataset();
@@ -1087,6 +1155,44 @@
 
         function metricLabel() {
           return calendarState.metric === "rate" ? "收益率" : "收益额";
+        }
+
+        function formatBreakdownAmount(value) {
+          const numericValue = Number(value) || 0.0;
+          const sign = numericValue > 0 ? "+" : "";
+          return `${sign}${numericValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${rawMoneyPayload.baseCurrency}`;
+        }
+
+        function renderProductProfitBreakdown(day) {
+          const items = day.productBreakdown || [];
+          const maxAbs = Math.max(...items.map((item) => Math.abs(item.value || 0.0)), 0.0);
+          const rows = items.length
+            ? items.map((item) => {
+                const value = Number(item.value) || 0.0;
+                const tone = value > 0 ? "positive" : (value < 0 ? "negative" : "flat");
+                const width = maxAbs > 0 ? Math.max(2, (Math.abs(value) / maxAbs) * 100) : 0;
+                return `
+                  <div class="calendar-breakdown-row ${item.kind === "residual" ? "residual" : ""}">
+                    <div class="calendar-breakdown-line">
+                      <span>${escapeHtml(item.label || "未命名产品")}</span>
+                      <strong class="${tone}">${escapeHtml(formatBreakdownAmount(value))}</strong>
+                    </div>
+                    <div class="calendar-breakdown-bar" aria-hidden="true">
+                      <span class="calendar-breakdown-fill ${tone}" style="width: ${width.toFixed(2)}%"></span>
+                    </div>
+                  </div>
+                `;
+              }).join("")
+            : `<p class="calendar-breakdown-empty">当日没有产品收益变动</p>`;
+          return `
+            <section class="calendar-breakdown">
+              <div class="calendar-breakdown-head">
+                <h4>产品收益拆分</h4>
+                <span>${escapeHtml(formatBreakdownAmount(day.amount))}</span>
+              </div>
+              <div class="calendar-breakdown-list">${rows}</div>
+            </section>
+          `;
         }
 
         function colorStyleFor(value, maxAbs) {
@@ -1217,6 +1323,7 @@
               <div><dt>最好的一天</dt><dd>${summary.bestDay ? `${summary.bestDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.bestDay))}` : "--"}</dd></div>
               <div><dt>最差的一天</dt><dd>${summary.worstDay ? `${summary.worstDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.worstDay))}` : "--"}</dd></div>
             </dl>
+            ${renderProductProfitBreakdown({ amount: totalAmount, productBreakdown: calendarDataset.productBreakdown })}
           `);
         }
 
@@ -1271,6 +1378,7 @@
               <div><dt>最好的一天</dt><dd>${summary.bestDay ? `${summary.bestDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.bestDay))}` : "--"}</dd></div>
               <div><dt>最差的一天</dt><dd>${summary.worstDay ? `${summary.worstDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.worstDay))}` : "--"}</dd></div>
             </dl>
+            ${renderProductProfitBreakdown(yearBucket)}
           `);
         }
 
@@ -1339,6 +1447,7 @@
                 <div><dt>累计收益额</dt><dd>${escapeHtml(`${selectedDay.cumulativeProfit.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${rawMoneyPayload.baseCurrency}`)}</dd></div>
                 <div><dt>累计总市值 TWR</dt><dd>${escapeHtml(`${selectedDay.cumulativeRate.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`)}</dd></div>
               </dl>
+              ${renderProductProfitBreakdown(selectedDay)}
             `);
           } else {
             renderCalendarDetail(`
@@ -1352,6 +1461,7 @@
                 <div><dt>最好的一天</dt><dd>${summary.bestDay ? `${summary.bestDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.bestDay))}` : "--"}</dd></div>
                 <div><dt>最差的一天</dt><dd>${summary.worstDay ? `${summary.worstDay.date} · ${formatCalendarMetric(calendarMetricValue(summary.worstDay))}` : "--"}</dd></div>
               </dl>
+              ${renderProductProfitBreakdown(monthBucket)}
             `);
           }
         }

@@ -83,6 +83,7 @@ def build_dashboard(connection, base_currency: str = "CNY") -> Dict[str, object]
     latest_cash = _latest_cash_balances(connection)
     price_rows = _price_history_rows(connection)
     fx_rows = _fx_history_rows(connection)
+    accounts_count = db.fetch_one(connection, "SELECT COUNT(1) AS count FROM accounts")["count"]
     price_map = _latest_prices(price_rows)
     fx_pairs = _latest_fx_pairs(fx_rows)
 
@@ -119,6 +120,7 @@ def build_dashboard(connection, base_currency: str = "CNY") -> Dict[str, object]
             "products": len(products),
         },
         "timeseries": timeseries,
+        "accounts_count": accounts_count,
         "products": product_views,
         "allocation": allocation,
         "rebalance": rebalance,
@@ -244,10 +246,28 @@ def _latest_cash_balances(connection) -> List[dict]:
         return []
     rows = db.fetch_all(
         connection,
-        "SELECT * FROM cash_balances WHERE snapshot_time = ?",
+        """
+        SELECT cb.*, a.base_currency AS account_base_currency
+        FROM cash_balances cb
+        JOIN accounts a ON a.id = cb.account_id
+        WHERE cb.snapshot_time = ?
+        """,
         [latest["snapshot_time"]],
     )
-    return [dict(row) for row in rows]
+    normalized = [dict(row) for row in rows]
+    accounts_with_currency_detail = {
+        row["account_id"]
+        for row in normalized
+        if row["currency"] != "BASE_SUMMARY"
+    }
+    result = []
+    for row in normalized:
+        if row["currency"] == "BASE_SUMMARY":
+            if row["account_id"] in accounts_with_currency_detail:
+                continue
+            row["currency"] = row["account_base_currency"]
+        result.append(row)
+    return result
 
 
 def _price_history_rows(connection) -> List[dict]:
@@ -320,9 +340,7 @@ def _rebuild_holdings(transactions, position_snapshots, cash_snapshots, fx_pairs
     running_cash_by_account_currency = defaultdict(float)
     pending_asset_by_account_currency = defaultdict(float)
     pending_subscriptions_by_instrument = defaultdict(float)
-    pending_redemptions_by_instrument = defaultdict(float)
-    pending_redemption_quantities_by_instrument = defaultdict(float)
-    pending_redemption_fees_by_instrument = defaultdict(float)
+    pending_redemption_lots_by_instrument = defaultdict(list)
 
     for row in transactions:
         normalized_row = dict(row)
@@ -330,9 +348,7 @@ def _rebuild_holdings(transactions, position_snapshots, cash_snapshots, fx_pairs
             normalized_row,
             pending_asset_by_account_currency,
             pending_subscriptions_by_instrument,
-            pending_redemptions_by_instrument,
-            pending_redemption_quantities_by_instrument,
-            pending_redemption_fees_by_instrument,
+            pending_redemption_lots_by_instrument,
         )
         effect = _transaction_effect(normalized_row)
         if quantity_override is not None:
@@ -395,8 +411,10 @@ def _rebuild_holdings(transactions, position_snapshots, cash_snapshots, fx_pairs
             average_cost = bucket["average_cost"]
             cost_removed = average_cost * quantity_sold
             proceeds = row["gross_amount"] or abs(row["cash_amount"] or 0.0)
-            proceeds -= (row["commission_total"] or 0.0) + (row["stamp_duty"] or 0.0) + (row["transfer_fee"] or 0.0) + (row["other_fee"] or 0.0)
-            bucket["quantity"] -= quantity_sold
+            if row["activity_type"] != "fund_redemption_in":
+                proceeds -= (row["commission_total"] or 0.0) + (row["stamp_duty"] or 0.0) + (row["transfer_fee"] or 0.0) + (row["other_fee"] or 0.0)
+            remaining_quantity = bucket["quantity"] - quantity_sold
+            bucket["quantity"] = 0.0 if abs(remaining_quantity) < 1e-8 else remaining_quantity
             bucket["cost_basis_total"] = max(0.0, bucket["cost_basis_total"] - cost_removed)
             bucket["realized_pnl"] += proceeds - cost_removed
             bucket["average_cost"] = bucket["cost_basis_total"] / bucket["quantity"] if bucket["quantity"] else 0.0
@@ -542,7 +560,14 @@ def _benchmark_catalog(products, price_rows):
 
 def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
     if not transactions:
-        return {"nav": [], "net_contribution": []}
+        return {
+            "nav": [],
+            "net_contribution": [],
+            "total_twr": [],
+            "effective_twr": [],
+            "peak_cost_rate": [],
+            "product_profit_breakdown": [],
+        }
 
     start = datetime.strptime(transactions[0]["trade_date"], "%Y-%m-%d").date()
     end = date.today()
@@ -550,10 +575,9 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
     cash_state = defaultdict(float)
     effective_bridge_by_currency = defaultdict(float)
     pending_asset_by_currency = defaultdict(float)
+    pending_asset_by_instrument = defaultdict(float)
     pending_subscriptions_by_instrument = defaultdict(float)
-    pending_redemptions_by_instrument = defaultdict(float)
-    pending_redemption_quantities_by_instrument = defaultdict(float)
-    pending_redemption_fees_by_instrument = defaultdict(float)
+    pending_redemption_lots_by_instrument = defaultdict(list)
     price_state: Dict[str, Tuple[float, str]] = {}
     instrument_state: Dict[str, Dict[str, str]] = {}
     fx_state: Dict[Tuple[str, str], float] = {}
@@ -562,9 +586,12 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
     total_twr_series = []
     effective_twr_series = []
     peak_cost_rate_series = []
+    product_profit_breakdown = []
     tx_by_date = defaultdict(list)
-    for row in transactions:
-        tx_by_date[row["trade_date"]].append(dict(row))
+    timeline_transactions = [dict(row) for row in transactions]
+    _pair_fund_redemption_settlements(timeline_transactions)
+    for row in timeline_transactions:
+        tx_by_date[row["trade_date"]].append(row)
     price_by_date = defaultdict(list)
     for row in price_rows:
         price_by_date[row["price_date"]].append(row)
@@ -577,25 +604,41 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
     cumulative_effective_twr = 1.0
     previous_total_nav = 0.0
     previous_effective_nav = 0.0
+    previous_profit_value = 0.0
+    previous_product_values = {}
     running_peak_contribution = 0.0
     current = start
     while current <= end:
         day_key = current.isoformat()
         day_total_flow_base = 0.0
         day_effective_flow_base = 0.0
+        day_product_cash_base = defaultdict(float)
         for row in fx_by_date.get(day_key, []):
             fx_state[(row["base_currency"], row["quote_currency"])] = row["rate"]
+        fund_flow_price_state = dict(price_state)
+        for row in price_by_date.get(day_key, []):
+            if row.get("asset_class") == "repo":
+                fund_flow_price_state[row["instrument_id"]] = (1.0, row["currency"])
+            else:
+                fund_flow_price_state[row["instrument_id"]] = (row["close_price"], row["currency"])
         for row in tx_by_date.get(day_key, []):
-            row = _enrich_fund_flow_row(dict(row), price_state)
+            row = dict(row)
+            row = _enrich_fund_flow_row(row, fund_flow_price_state)
+            currency = row["currency"] or "CNY"
+            pending_before = pending_asset_by_currency[currency]
             quantity_override = _special_fund_flow_quantity_override(
                 row,
                 pending_asset_by_currency,
                 pending_subscriptions_by_instrument,
-                pending_redemptions_by_instrument,
-                pending_redemption_quantities_by_instrument,
-                pending_redemption_fees_by_instrument,
+                pending_redemption_lots_by_instrument,
                 account_key=False,
             )
+            pending_delta = pending_asset_by_currency[currency] - pending_before
+            instrument_id = row["instrument_id"]
+            if instrument_id and pending_delta:
+                pending_asset_by_instrument[instrument_id] += pending_delta
+                if abs(pending_asset_by_instrument[instrument_id]) < 1e-8:
+                    pending_asset_by_instrument[instrument_id] = 0.0
             effect = _transaction_effect(row)
             if quantity_override is not None:
                 effect = TransactionEffect(
@@ -603,9 +646,11 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
                     cash_delta=effect.cash_delta,
                     trade_value=effect.trade_value,
                 )
-            currency = row["currency"] or "CNY"
-            for cash_currency, delta in _cash_effects(row).items():
+            cash_effects = _cash_effects(row)
+            for cash_currency, delta in cash_effects.items():
                 cash_state[cash_currency] += delta
+                if instrument_id and not row["external_flow"]:
+                    day_product_cash_base[instrument_id] += delta * _resolve_fx_rate(cash_currency, base_currency, fx_state)
             bridge_delta = _effective_bridge_cash_delta(row)
             if bridge_delta:
                 effective_bridge_by_currency[currency] += bridge_delta
@@ -615,17 +660,20 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
                 running_contribution += flow_base
                 day_total_flow_base += flow_base
                 day_effective_flow_base += flow_base
-            instrument_id = row["instrument_id"]
-            if instrument_id and row["activity_type"] not in NO_POSITION_ACTIVITIES:
+            if instrument_id:
                 instrument_state[instrument_id] = {
                     "asset_class": row.get("asset_class") or "other",
                     "currency": currency,
+                    "name": row.get("name") or row.get("description") or "",
+                    "symbol": row.get("symbol") or "",
                 }
+            if instrument_id and row["activity_type"] not in NO_POSITION_ACTIVITIES:
                 opening_value = _seed_opening_position_state(position_state, row, effect)
                 if opening_value > 0:
                     opening_value_base = opening_value * _resolve_fx_rate(currency, base_currency, fx_state)
                     running_contribution += opening_value_base
                     day_total_flow_base += opening_value_base
+                    day_product_cash_base[instrument_id] -= opening_value_base
                     if row.get("asset_class") not in EXCLUDED_EFFECTIVE_ASSET_CLASSES:
                         day_effective_flow_base += opening_value_base
                 position_state[instrument_id] += effect.quantity_delta
@@ -647,6 +695,7 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
 
         nav_total = 0.0
         excluded_effective_nav = 0.0
+        current_product_values = defaultdict(float)
         for instrument_id, quantity in position_state.items():
             if quantity <= 0:
                 continue
@@ -657,12 +706,17 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
             unit_multiplier = 100.0 if instrument_meta.get("asset_class") == "option" else 1.0
             market_value_base = quantity * price * unit_multiplier * _resolve_fx_rate(currency, base_currency, fx_state)
             nav_total += market_value_base
+            current_product_values[instrument_id] += market_value_base
             if instrument_meta.get("asset_class") in EXCLUDED_EFFECTIVE_ASSET_CLASSES:
                 excluded_effective_nav += market_value_base
         for currency, amount in cash_state.items():
             nav_total += amount * _resolve_fx_rate(currency, base_currency, fx_state)
         for currency, amount in pending_asset_by_currency.items():
             nav_total += amount * _resolve_fx_rate(currency, base_currency, fx_state)
+        for instrument_id, amount in pending_asset_by_instrument.items():
+            instrument_meta = instrument_state.get(instrument_id, {})
+            currency = instrument_meta.get("currency", "CNY")
+            current_product_values[instrument_id] += amount * _resolve_fx_rate(currency, base_currency, fx_state)
         effective_bridge_nav = 0.0
         for currency, amount in effective_bridge_by_currency.items():
             effective_bridge_nav += amount * _resolve_fx_rate(currency, base_currency, fx_state)
@@ -673,6 +727,50 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
         cumulative_effective_twr *= 1.0 + daily_effective_twr
         running_peak_contribution = max(running_peak_contribution, running_contribution)
         profit_value = nav_total - running_contribution
+        daily_profit_value = profit_value - previous_profit_value
+        breakdown_items = []
+        product_ids = set(previous_product_values) | set(current_product_values) | set(day_product_cash_base)
+        for instrument_id in product_ids:
+            product_profit = (
+                current_product_values.get(instrument_id, 0.0)
+                - previous_product_values.get(instrument_id, 0.0)
+                + day_product_cash_base.get(instrument_id, 0.0)
+            )
+            rounded_profit = round(product_profit, 2)
+            if abs(rounded_profit) < 0.01:
+                continue
+            instrument_meta = instrument_state.get(instrument_id, {})
+            breakdown_items.append(
+                {
+                    "instrument_id": instrument_id,
+                    "label": _display_label(
+                        instrument_meta.get("name", ""),
+                        instrument_meta.get("symbol", "") or instrument_id,
+                    ),
+                    "asset_class": instrument_meta.get("asset_class", "other"),
+                    "value": rounded_profit,
+                    "kind": "product",
+                }
+            )
+        residual = round(daily_profit_value - sum(item["value"] for item in breakdown_items), 2)
+        if abs(residual) >= 0.01:
+            breakdown_items.append(
+                {
+                    "instrument_id": None,
+                    "label": "现金、汇率及其他",
+                    "asset_class": "cash",
+                    "value": residual,
+                    "kind": "residual",
+                }
+            )
+        breakdown_items.sort(key=lambda item: abs(item["value"]), reverse=True)
+        product_profit_breakdown.append(
+            {
+                "date": day_key,
+                "total": round(daily_profit_value, 2),
+                "items": breakdown_items,
+            }
+        )
         nav_series.append({"date": day_key, "value": round(nav_total, 2)})
         contribution_series.append({"date": day_key, "value": round(running_contribution, 2)})
         total_twr_series.append({"date": day_key, "value": round((cumulative_total_twr - 1.0) * 100.0, 4)})
@@ -685,6 +783,8 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
         )
         previous_total_nav = nav_total
         previous_effective_nav = effective_nav
+        previous_profit_value = profit_value
+        previous_product_values = dict(current_product_values)
         current += timedelta(days=1)
     return {
         "nav": nav_series,
@@ -692,7 +792,27 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
         "total_twr": total_twr_series,
         "effective_twr": effective_twr_series,
         "peak_cost_rate": peak_cost_rate_series,
+        "product_profit_breakdown": product_profit_breakdown,
     }
+
+
+def _pair_fund_redemption_settlements(transactions: List[Dict[str, object]]) -> None:
+    pending_rows = defaultdict(list)
+    for row in transactions:
+        if row.get("activity_type") != "fund_redemption_in":
+            continue
+        instrument_id = row.get("instrument_id")
+        if not instrument_id:
+            continue
+        key = (row.get("account_id"), instrument_id, row.get("currency") or "CNY")
+        quantity = float(row.get("quantity") or 0.0)
+        cash_amount = float(row.get("cash_amount") or 0.0)
+        if quantity > 0.0 and cash_amount == 0.0:
+            pending_rows[key].append(row)
+        elif quantity == 0.0 and cash_amount > 0.0 and pending_rows[key]:
+            application_row = pending_rows[key].pop(0)
+            if not float(application_row.get("gross_amount") or 0.0):
+                application_row["gross_amount"] = abs(cash_amount)
 
 
 def _enrich_fund_flow_row(row: Dict[str, object], price_state: Dict[str, Tuple[float, str]]) -> Dict[str, object]:
@@ -860,6 +980,10 @@ def _cash_effects(row: Dict[str, object]) -> Dict[str, float]:
         effects[base_ccy] = effects.get(base_ccy, 0.0) + base_delta
     if cash_amount:
         effects[currency] = effects.get(currency, 0.0) + cash_amount
+    commission_total = abs(float(row.get("commission_total") or 0.0))
+    commission_currency = (raw.get("ibCommissionCurrency") or "").upper()
+    if commission_total and commission_currency:
+        effects[commission_currency] = effects.get(commission_currency, 0.0) - commission_total
     return effects
 
 
@@ -996,9 +1120,7 @@ def _special_fund_flow_quantity_override(
     row: Dict[str, object],
     pending_asset_state,
     pending_subscriptions_by_instrument,
-    pending_redemptions_by_instrument,
-    pending_redemption_quantities_by_instrument,
-    pending_redemption_fees_by_instrument,
+    pending_redemption_lots_by_instrument,
     *,
     account_key: bool = True,
 ):
@@ -1024,32 +1146,55 @@ def _special_fund_flow_quantity_override(
         return None
 
     if activity_type == "fund_redemption_in" and gross_amount > 0:
-        if quantity > 0.0 and cash_amount == 0.0:
-            pending_redemption_quantities_by_instrument[instrument_id] += quantity
-            pending_redemption_fees_by_instrument[instrument_id] += float(row.get("other_fee") or 0.0)
-        if cash_amount == 0.0:
+        lots = pending_redemption_lots_by_instrument[instrument_id] if instrument_id else []
+        if cash_amount > 0.0:
+            matched_index = next(
+                (index for index, lot in enumerate(lots) if abs(lot["amount"] - gross_amount) <= 0.01),
+                None,
+            )
+            if matched_index is not None:
+                settled = lots.pop(matched_index)
+                pending_asset_state[settled["owner_key"]] -= settled["amount"]
+                return 0.0
+        else:
             pending_asset_state[owner_key] += gross_amount
             if instrument_id:
-                pending_redemptions_by_instrument[instrument_id] += gross_amount
+                lots.append(
+                    {
+                        "amount": gross_amount,
+                        "quantity": quantity,
+                        "fee": float(row.get("other_fee") or 0.0),
+                        "owner_key": owner_key,
+                    }
+                )
             return None
-        if instrument_id and pending_redemptions_by_instrument[instrument_id] >= gross_amount - 0.01:
-            pending_asset_state[owner_key] -= gross_amount
-            pending_redemptions_by_instrument[instrument_id] -= gross_amount
-            return 0.0
-
     if activity_type == "fund_redemption_in" and quantity > 0.0 and gross_amount == 0.0 and cash_amount == 0.0:
         if instrument_id:
-            pending_redemption_quantities_by_instrument[instrument_id] += quantity
-            pending_redemption_fees_by_instrument[instrument_id] += float(row.get("other_fee") or 0.0)
+            pending_redemption_lots_by_instrument[instrument_id].append(
+                {
+                    "amount": 0.0,
+                    "quantity": quantity,
+                    "fee": float(row.get("other_fee") or 0.0),
+                    "owner_key": owner_key,
+                }
+            )
         return 0.0
 
     if activity_type == "fund_redemption_in" and quantity == 0.0 and gross_amount == 0.0 and cash_amount > 0.0:
-        if instrument_id and pending_redemption_quantities_by_instrument[instrument_id] > 0.0:
+        lots = pending_redemption_lots_by_instrument[instrument_id] if instrument_id else []
+        matched_index = next(
+            (index for index, lot in enumerate(lots) if lot["amount"] > 0.0 and abs(lot["amount"] - abs(cash_amount)) <= 0.01),
+            None,
+        )
+        if matched_index is not None:
+            settled = lots.pop(matched_index)
+            pending_asset_state[settled["owner_key"]] -= settled["amount"]
+            return 0.0
+        quantity_only_index = next((index for index, lot in enumerate(lots) if lot["amount"] == 0.0), None)
+        if quantity_only_index is not None:
+            settled = lots.pop(quantity_only_index)
             row["gross_amount"] = abs(cash_amount)
-            if pending_redemption_fees_by_instrument[instrument_id] > 0.0:
-                row["other_fee"] = float(row.get("other_fee") or 0.0) + pending_redemption_fees_by_instrument[instrument_id]
-                pending_redemption_fees_by_instrument[instrument_id] = 0.0
-            settled_quantity = pending_redemption_quantities_by_instrument[instrument_id]
-            pending_redemption_quantities_by_instrument[instrument_id] = 0.0
-            return -settled_quantity
+            if settled["fee"] > 0.0:
+                row["other_fee"] = float(row.get("other_fee") or 0.0) + settled["fee"]
+            return -settled["quantity"]
     return None

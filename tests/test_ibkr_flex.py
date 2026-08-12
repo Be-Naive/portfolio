@@ -26,7 +26,8 @@ SAMPLE_XML = """
         <OpenPosition accountId="U1234567" assetCategory="STK" symbol="VOO" description="Vanguard S&amp;P 500 ETF" conid="756733" currency="USD" position="10" markPrice="505" costBasisPrice="500" positionValue="5050" fifoPnlUnrealized="50" />
       </OpenPositions>
       <CashReport>
-        <CashReportCurrency accountId="U1234567" currency="USD" endingCash="2064" />
+        <CashReportCurrency accountId="U1234567" currency="BASE_SUMMARY" levelOfDetail="BaseCurrency" endingCash="2064" />
+        <CashReportCurrency accountId="U1234567" currency="USD" levelOfDetail="Currency" endingCash="2064" />
       </CashReport>
       <ConversionRates>
         <ConversionRate reportDate="2026-03-21" fromCurrency="HKD" toCurrency="USD" rate="0.1287" />
@@ -78,6 +79,28 @@ class IbkrFlexParserTest(unittest.TestCase):
             "2026-05-08",
         )
         self.assertEqual(prices[0]["close_price"], 1.6582)
+
+    def test_summary_cash_row_is_skipped_when_detail_rows_add_to_same_amount(self):
+        xml = """
+        <FlexQueryResponse queryName="Cash" type="AF">
+          <FlexStatements count="1">
+            <FlexStatement accountId="U1234567" fromDate="2026-06-10" toDate="2026-06-10">
+              <AccountInformation accountId="U1234567" currency="USD" />
+              <CashTransactions>
+                <CashTransaction accountId="U1234567" type="Deposits/Withdrawals" description="CASH RECEIPTS / ELECTRONIC FUND TRANSFERS" currency="CNH" reportDate="20260610" settleDate="20260610" amount="40000" levelOfDetail="DETAIL" />
+                <CashTransaction accountId="U1234567" type="Deposits/Withdrawals" description="CASH RECEIPTS / ELECTRONIC FUND TRANSFERS" currency="CNH" reportDate="20260610" settleDate="20260611" amount="60000" levelOfDetail="DETAIL" />
+                <CashTransaction accountId="-" type="Deposits/Withdrawals" description="CASH RECEIPTS / ELECTRONIC FUND TRANSFERS" currency="CNH" reportDate="20260610" settleDate="20260611" amount="100000" levelOfDetail="SUMMARY" />
+              </CashTransactions>
+            </FlexStatement>
+          </FlexStatements>
+        </FlexQueryResponse>
+        """
+
+        parsed = parse_flex_statement_xml(xml)
+        deposits = [tx for tx in parsed.transactions if tx["activity_type"] == "bank_transfer_in"]
+
+        self.assertEqual(len(deposits), 2)
+        self.assertEqual(sum(tx["cash_amount"] for tx in deposits), 100000.0)
 
 
 if __name__ == "__main__":

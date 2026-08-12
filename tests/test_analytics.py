@@ -1,5 +1,7 @@
 import json
+import sqlite3
 import unittest
+from datetime import date, timedelta
 
 from portfolio_app.analytics import (
     _build_timeseries,
@@ -8,6 +10,7 @@ from portfolio_app.analytics import (
     _display_label,
     _effective_bridge_cash_delta,
     _filter_bootstrap_price_rows,
+    _latest_cash_balances,
     _modified_dietz_return,
     _product_analysis,
     _cash_effects,
@@ -20,6 +23,78 @@ from portfolio_app.analytics import (
 
 
 class AnalyticsTest(unittest.TestCase):
+    def test_empty_timeseries_preserves_chart_series_shape(self):
+        self.assertEqual(
+            _build_timeseries([], [], [], "CNY"),
+            {
+                "nav": [],
+                "net_contribution": [],
+                "total_twr": [],
+                "effective_twr": [],
+                "peak_cost_rate": [],
+                "product_profit_breakdown": [],
+            },
+        )
+
+    def test_timeseries_product_profit_breakdown_reconciles_to_daily_profit(self):
+        trade_date = (date.today() - timedelta(days=1)).isoformat()
+        price_date = date.today().isoformat()
+        transactions = [
+            {
+                "trade_date": trade_date,
+                "activity_type": "security_buy",
+                "description": "Test holding",
+                "external_flow": 0,
+                "quantity": 10.0,
+                "price": 10.0,
+                "gross_amount": 100.0,
+                "cash_amount": -100.0,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "test:holding",
+                "account_id": "acct",
+                "asset_class": "equity",
+                "name": "测试产品",
+                "symbol": "TEST",
+                "other_fee": None,
+            }
+        ]
+        price_rows = [
+            {
+                "price_date": trade_date,
+                "instrument_id": "test:holding",
+                "close_price": 10.0,
+                "currency": "CNY",
+                "asset_class": "equity",
+            },
+            {
+                "price_date": price_date,
+                "instrument_id": "test:holding",
+                "close_price": 12.0,
+                "currency": "CNY",
+                "asset_class": "equity",
+            },
+        ]
+
+        series = _build_timeseries(transactions, price_rows, [], "CNY")
+        breakdown = {item["date"]: item for item in series["product_profit_breakdown"]}
+
+        self.assertEqual(breakdown[trade_date]["total"], 0.0)
+        self.assertEqual(breakdown[price_date]["total"], 20.0)
+        self.assertEqual(
+            breakdown[price_date]["items"],
+            [
+                {
+                    "instrument_id": "test:holding",
+                    "label": "测试产品 (TEST)",
+                    "asset_class": "equity",
+                    "value": 20.0,
+                    "kind": "product",
+                }
+            ],
+        )
+        self.assertEqual(sum(item["value"] for item in breakdown[price_date]["items"]), breakdown[price_date]["total"])
+
     def test_parse_targets(self):
         parsed = parse_rebalance_targets("equity: 40\nfund=35\ncash 25")
         self.assertEqual(parsed["equity"], 40.0)
@@ -160,11 +235,63 @@ class AnalyticsTest(unittest.TestCase):
             "cash_amount": -128.0,
             "currency": "SGD",
             "symbol": "USD.SGD",
-            "raw_json": json.dumps({"buySell": "BUY", "symbol": "USD.SGD"}),
+            "commission_total": 2.0,
+            "raw_json": json.dumps(
+                {
+                    "buySell": "BUY",
+                    "symbol": "USD.SGD",
+                    "ibCommissionCurrency": "USD",
+                }
+            ),
         }
         effects = _cash_effects(row)
-        self.assertEqual(effects["USD"], 100.0)
+        self.assertEqual(effects["USD"], 98.0)
         self.assertEqual(effects["SGD"], -128.0)
+
+    def test_latest_cash_balances_ignores_base_summary_when_currency_detail_exists(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE accounts (id TEXT PRIMARY KEY, base_currency TEXT NOT NULL);
+            CREATE TABLE cash_balances (
+                account_id TEXT NOT NULL,
+                snapshot_time TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                amount REAL NOT NULL
+            );
+            INSERT INTO accounts VALUES ('ibkr:U1', 'USD');
+            INSERT INTO cash_balances VALUES ('ibkr:U1', '2026-08-11T23:59:59Z', 'BASE_SUMMARY', 74.14);
+            INSERT INTO cash_balances VALUES ('ibkr:U1', '2026-08-11T23:59:59Z', 'USD', 74.14);
+            """
+        )
+
+        rows = _latest_cash_balances(connection)
+
+        self.assertEqual([(row["currency"], row["amount"]) for row in rows], [("USD", 74.14)])
+        connection.close()
+
+    def test_latest_cash_balances_maps_lone_base_summary_to_account_currency(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE accounts (id TEXT PRIMARY KEY, base_currency TEXT NOT NULL);
+            CREATE TABLE cash_balances (
+                account_id TEXT NOT NULL,
+                snapshot_time TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                amount REAL NOT NULL
+            );
+            INSERT INTO accounts VALUES ('ibkr:U1', 'USD');
+            INSERT INTO cash_balances VALUES ('ibkr:U1', '2026-08-11T23:59:59Z', 'BASE_SUMMARY', 74.14);
+            """
+        )
+
+        rows = _latest_cash_balances(connection)
+
+        self.assertEqual([(row["currency"], row["amount"]) for row in rows], [("USD", 74.14)])
+        connection.close()
 
     def test_resolve_cross_fx_rate(self):
         pair_map = {
@@ -313,7 +440,168 @@ class AnalyticsTest(unittest.TestCase):
         holdings, _cash = _rebuild_holdings(transactions, [], [], {}, "CNY")
         bucket = holdings["gtja:000218"]
         self.assertEqual(bucket["quantity"], 0.0)
-        self.assertAlmostEqual(bucket["realized_pnl"], 1922.13, places=2)
+        self.assertAlmostEqual(bucket["realized_pnl"], 1935.62, places=2)
+
+    def test_timeseries_settles_quantity_only_fund_redemption_without_double_counting(self):
+        transactions = [
+            {
+                "trade_date": "2025-03-28",
+                "activity_type": "fund_subscription_confirm",
+                "external_flow": 0,
+                "quantity": 9658.46,
+                "price": 2.595115301,
+                "gross_amount": 25063.0,
+                "cash_amount": None,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "gtja:000218",
+                "account_id": "acct",
+                "asset_class": "fund",
+                "other_fee": None,
+            },
+            {
+                "trade_date": "2025-07-14",
+                "activity_type": "fund_redemption_in",
+                "external_flow": 0,
+                "quantity": 9658.46,
+                "price": None,
+                "gross_amount": None,
+                "cash_amount": None,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "gtja:000218",
+                "account_id": "acct",
+                "asset_class": "fund",
+                "other_fee": 13.49,
+            },
+            {
+                "trade_date": "2025-07-16",
+                "activity_type": "fund_redemption_in",
+                "external_flow": 0,
+                "quantity": None,
+                "price": None,
+                "gross_amount": None,
+                "cash_amount": 26935.62,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "gtja:000218",
+                "account_id": "acct",
+                "asset_class": "fund",
+                "other_fee": None,
+            },
+        ]
+
+        price_rows = [
+            {
+                "price_date": "2025-07-11",
+                "instrument_id": "gtja:000218",
+                "close_price": 2.7902,
+                "currency": "CNY",
+                "asset_class": "fund",
+            },
+            {
+                "price_date": "2025-07-14",
+                "instrument_id": "gtja:000218",
+                "close_price": 2.8217,
+                "currency": "CNY",
+                "asset_class": "fund",
+            },
+        ]
+
+        series = _build_timeseries(transactions, price_rows, [], "CNY")
+        nav = {point["date"]: point["value"] for point in series["nav"]}
+
+        self.assertAlmostEqual(nav["2025-07-11"], round(9658.46 * 2.7902, 2), places=2)
+        self.assertAlmostEqual(nav["2025-07-14"], 26935.62, places=2)
+        self.assertAlmostEqual(nav["2025-07-15"], 26935.62, places=2)
+        self.assertAlmostEqual(nav["2025-07-16"], 26935.62, places=2)
+        self.assertAlmostEqual(nav["2025-07-16"] - nav["2025-07-15"], 0.0, places=2)
+
+    def test_timeseries_does_not_match_a_smaller_redemption_to_a_pending_settlement(self):
+        transactions = [
+            {
+                "trade_date": "2025-03-28",
+                "activity_type": "fund_subscription_confirm",
+                "external_flow": 0,
+                "quantity": 42632.65,
+                "price": 1.29,
+                "gross_amount": 55000.0,
+                "cash_amount": None,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "gtja:002362",
+                "account_id": "acct",
+                "asset_class": "fund",
+                "other_fee": None,
+            },
+            {
+                "trade_date": "2026-02-13",
+                "activity_type": "fund_redemption_in",
+                "external_flow": 0,
+                "quantity": 5457.0,
+                "price": 1.343,
+                "gross_amount": 7328.75,
+                "cash_amount": None,
+                "position_balance": 37175.65,
+                "currency": "CNY",
+                "instrument_id": "gtja:002362",
+                "account_id": "acct",
+                "asset_class": "fund",
+                "other_fee": None,
+            },
+            {
+                "trade_date": "2026-02-24",
+                "activity_type": "fund_redemption_in",
+                "external_flow": 0,
+                "quantity": 37175.65,
+                "price": 1.342,
+                "gross_amount": 49889.72,
+                "cash_amount": None,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "gtja:002362",
+                "account_id": "acct",
+                "asset_class": "fund",
+                "other_fee": None,
+            },
+            {
+                "trade_date": "2026-02-25",
+                "activity_type": "fund_redemption_in",
+                "external_flow": 0,
+                "quantity": 5457.0,
+                "price": 1.343,
+                "gross_amount": 7328.75,
+                "cash_amount": 7328.75,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "gtja:002362",
+                "account_id": "acct",
+                "asset_class": "fund",
+                "other_fee": None,
+            },
+            {
+                "trade_date": "2026-02-26",
+                "activity_type": "fund_redemption_in",
+                "external_flow": 0,
+                "quantity": 37175.65,
+                "price": 1.342,
+                "gross_amount": 49889.72,
+                "cash_amount": 49889.72,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "gtja:002362",
+                "account_id": "acct",
+                "asset_class": "fund",
+                "other_fee": None,
+            },
+        ]
+
+        series = _build_timeseries(transactions, [], [], "CNY")
+        nav = {point["date"]: point["value"] for point in series["nav"]}
+        contribution = series["net_contribution"][-1]["value"]
+
+        self.assertAlmostEqual(nav["2026-02-26"], 57218.47, places=2)
+        self.assertAlmostEqual(contribution, 0.0, places=2)
 
     def test_cash_management_full_position_adjustment_out_clears_cost_basis(self):
         transactions = [

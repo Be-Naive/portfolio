@@ -1,9 +1,11 @@
 import unittest
 
 from datetime import date
+from unittest.mock import Mock
 
 from portfolio_app.market_data import (
     _eastmoney_fund_code_for_instrument,
+    _fetch_eastmoney_fund_history,
     _instrument_query,
     _parse_jsonp_payload,
     _resolve_incremental_start,
@@ -13,6 +15,44 @@ from portfolio_app.market_data import (
 
 
 class MarketDataTest(unittest.TestCase):
+    def test_eastmoney_fund_history_paginates_structured_nav_rows(self):
+        first_response = Mock()
+        first_response.raise_for_status.return_value = None
+        first_response.json.return_value = {
+            "Data": {
+                "LSJZList": [
+                    {"FSRQ": "2025-07-16", "DWJZ": "2.8039"},
+                    {"FSRQ": "2025-07-15", "DWJZ": "2.8169"},
+                ]
+            },
+            "ErrCode": 0,
+            "TotalCount": 3,
+            "PageSize": 2,
+        }
+        second_response = Mock()
+        second_response.raise_for_status.return_value = None
+        second_response.json.return_value = {
+            "Data": {"LSJZList": [{"FSRQ": "2025-07-14", "DWJZ": "2.8217"}]},
+            "ErrCode": 0,
+            "TotalCount": 3,
+            "PageSize": 2,
+        }
+        session = Mock()
+        session.get.side_effect = [first_response, second_response]
+
+        rows = _fetch_eastmoney_fund_history(
+            session,
+            {"id": "gtja:000218", "currency": "CNY"},
+            "000218",
+            start_date="2025-03-18",
+        )
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[-1]["price_date"], "2025-07-14")
+        self.assertEqual(rows[-1]["close_price"], 2.8217)
+        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(session.get.call_args_list[1].kwargs["params"]["pageIndex"], 2)
+
     def test_eastmoney_fund_code_for_off_exchange_cn_fund(self):
         self.assertEqual(
             _eastmoney_fund_code_for_instrument(

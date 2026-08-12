@@ -13,7 +13,7 @@ import requests
 
 ECB_HISTORY_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.xml"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-EASTMONEY_FUND_NAV_URL = "https://api.fund.eastmoney.com/f10/LSJZChart"
+EASTMONEY_FUND_NAV_URL = "https://api.fund.eastmoney.com/f10/lsjz"
 SINA_KLINE_URL = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
 
 
@@ -429,42 +429,50 @@ def _fetch_eastmoney_fund_history(
     start_date: str = "2000-01-01",
     request_timeout: int = 30,
 ) -> list[dict]:
-    response = session.get(
-        EASTMONEY_FUND_NAV_URL,
-        params={
-            "callback": "jQuery",
-            "type": "0",
-            "fundCode": fund_code,
-            "pageIndex": "1",
-            "pageSize": "4000",
-            "startDate": start_date,
-            "endDate": datetime.now().date().isoformat(),
-        },
-        headers={"Referer": f"https://fundf10.eastmoney.com/jjjz_{fund_code}.html"},
-        timeout=request_timeout,
-    )
-    response.raise_for_status()
-    payload = _parse_jsonp_payload(response.text)
-    if payload.get("ErrCode") not in (0, None):
-        raise ValueError(payload.get("ErrMsg") or f"Eastmoney returned ErrCode={payload.get('ErrCode')}")
-
     rows = []
-    for item in payload.get("Data") or []:
-        if not isinstance(item, list) or len(item) < 2:
-            continue
-        timestamp_ms, unit_nav = item[0], item[1]
-        if unit_nav in (None, 0):
-            continue
-        price_date = datetime.utcfromtimestamp(float(timestamp_ms) / 1000.0).date().isoformat()
-        rows.append(
-            {
-                "instrument_id": instrument["id"],
-                "price_date": price_date,
-                "close_price": float(unit_nav),
-                "currency": instrument["currency"],
-                "source": "eastmoney_fund_nav",
-            }
+    page_index = 1
+    while True:
+        response = session.get(
+            EASTMONEY_FUND_NAV_URL,
+            params={
+                "fundCode": fund_code,
+                "pageIndex": page_index,
+                "pageSize": 20,
+                "startDate": start_date,
+                "endDate": datetime.now().date().isoformat(),
+            },
+            headers={"Referer": f"https://fundf10.eastmoney.com/jjjz_{fund_code}.html"},
+            timeout=request_timeout,
         )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("ErrCode") not in (0, None):
+            raise ValueError(payload.get("ErrMsg") or f"Eastmoney returned ErrCode={payload.get('ErrCode')}")
+
+        data = payload.get("Data") or {}
+        items = data.get("LSJZList") or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            price_date = item.get("FSRQ")
+            unit_nav = item.get("DWJZ")
+            if not price_date or unit_nav in (None, "", 0, "0"):
+                continue
+            rows.append(
+                {
+                    "instrument_id": instrument["id"],
+                    "price_date": price_date,
+                    "close_price": float(unit_nav),
+                    "currency": instrument["currency"],
+                    "source": "eastmoney_fund_nav",
+                }
+            )
+
+        total_count = int(payload.get("TotalCount") or len(items))
+        page_size = int(payload.get("PageSize") or 20)
+        if not items or page_index * page_size >= total_count:
+            break
+        page_index += 1
     return rows
 
 

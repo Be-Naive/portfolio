@@ -94,6 +94,11 @@ table {
   margin-bottom: 16px;
 }
 
+.grid > *,
+.panel {
+  min-width: 0;
+}
+
 .forms,
 .allocations,
 .rebalance {
@@ -183,6 +188,7 @@ label {
 
 input[type="text"],
 input[type="date"],
+input[type="file"],
 select,
 textarea {
   width: 100%;
@@ -209,6 +215,54 @@ button {
   font-weight: 700;
   padding: 11px 16px;
   cursor: pointer;
+}
+
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: auto;
+  border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent-2) 0%, #0d9488 100%);
+  color: #fff;
+  font-weight: 700;
+  padding: 11px 16px;
+  text-decoration: none;
+}
+
+.migration-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.migration-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.migration-stats div {
+  padding: 10px 12px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.migration-stats dt {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.migration-stats dd {
+  margin: 4px 0 0;
+  font-size: 1.08rem;
+  font-weight: 700;
+}
+
+.restore-confirmation {
+  margin-bottom: 0;
 }
 
 .ghost-button {
@@ -359,7 +413,7 @@ button {
 
 .calendar-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 280px;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 340px);
   gap: 16px;
   align-items: start;
 }
@@ -547,6 +601,95 @@ button {
   font-weight: 600;
 }
 
+.calendar-breakdown {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(15, 23, 42, 0.1);
+}
+
+.calendar-breakdown-head,
+.calendar-breakdown-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.calendar-breakdown-head {
+  align-items: baseline;
+  margin-bottom: 12px;
+}
+
+.calendar-breakdown-head h4 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.calendar-breakdown-head > span,
+.calendar-breakdown-empty {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.calendar-breakdown-list {
+  display: grid;
+  gap: 12px;
+  max-height: 420px;
+  overflow-y: auto;
+  padding-right: 3px;
+}
+
+.calendar-breakdown-row {
+  min-width: 0;
+}
+
+.calendar-breakdown-row.residual {
+  padding-top: 10px;
+  border-top: 1px dashed rgba(15, 23, 42, 0.14);
+}
+
+.calendar-breakdown-line {
+  align-items: flex-start;
+  margin-bottom: 6px;
+  font-size: 0.82rem;
+}
+
+.calendar-breakdown-line > span {
+  min-width: 0;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.calendar-breakdown-line strong {
+  flex: none;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.calendar-breakdown-line strong.positive { color: #166534; }
+.calendar-breakdown-line strong.negative { color: #b91c1c; }
+.calendar-breakdown-line strong.flat { color: var(--muted); }
+
+.calendar-breakdown-bar {
+  height: 4px;
+  overflow: hidden;
+  background: rgba(148, 163, 184, 0.14);
+  border-radius: 2px;
+}
+
+.calendar-breakdown-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+}
+
+.calendar-breakdown-fill.positive { background: #16a34a; }
+.calendar-breakdown-fill.negative { background: #dc2626; }
+.calendar-breakdown-fill.flat { background: #94a3b8; }
+
+.calendar-breakdown-empty {
+  margin: 0;
+}
+
 .swatch,
 .dot {
   width: 10px;
@@ -607,6 +750,18 @@ table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.92rem;
+}
+
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.table-scroll table {
+  min-width: 620px;
 }
 
 th,
