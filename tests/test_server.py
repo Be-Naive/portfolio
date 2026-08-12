@@ -1,6 +1,8 @@
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 from portfolio_app import db
 from portfolio_app.server import PortfolioApplication, _format_sync_time, _is_sync_stale
@@ -65,6 +67,31 @@ class ServerHelpersTest(unittest.TestCase):
             PortfolioApplication._historical_instrument_ids_missing_market_prices(connection),
             ["gtja:004475", "gtja:561990", "ibkr:NVDA"],
         )
+        connection.close()
+
+    def test_auto_refresh_failure_does_not_break_dashboard(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(db.SCHEMA)
+        dashboard = {
+            "products": [
+                {
+                    "instrument_id": "gtja:561990",
+                    "status": "open",
+                    "quantity": 1,
+                    "market_value_base": 1,
+                }
+            ]
+        }
+        app = PortfolioApplication.__new__(PortfolioApplication)
+        app.db_path = Path(":memory:")
+
+        with patch("portfolio_app.server.db.insert_sync_run", side_effect=sqlite3.OperationalError("readonly")):
+            result = app._maybe_auto_refresh_market_data(connection, dashboard)
+
+        self.assertTrue(result["triggered"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("readonly", result["error"])
         connection.close()
 
     def test_is_sync_stale_respects_ttl(self):

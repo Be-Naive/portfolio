@@ -69,6 +69,7 @@ class PortfolioApplication:
                 start_response,
                 status="500 Internal Server Error",
                 error=str(exc),
+                refresh_market_data=False,
             )
 
     def _index(self, environ, start_response):
@@ -345,10 +346,15 @@ class PortfolioApplication:
         custom_rebalance: Optional[Dict[str, object]] = None,
         custom_targets: Optional[str] = None,
         selected_rebalance_labels: Optional[list[str]] = None,
+        refresh_market_data: bool = True,
     ):
         with db.open_db(self.db_path) as connection:
             dashboard = analytics.build_dashboard(connection)
-            page_market_sync = self._maybe_auto_refresh_market_data(connection, dashboard)
+            page_market_sync = (
+                self._maybe_auto_refresh_market_data(connection, dashboard)
+                if refresh_market_data
+                else {"triggered": False, "status": "skipped", "reason": "error_response"}
+            )
             if page_market_sync.get("triggered") and page_market_sync.get("status") == "success":
                 dashboard = analytics.build_dashboard(connection)
             market_sync = self._build_market_sync_view(connection, dashboard, page_market_sync)
@@ -462,23 +468,23 @@ class PortfolioApplication:
 
         run_id = str(uuid.uuid4())
         started_at = _timestamp()
-        db.insert_sync_run(
-            connection,
-            {
-                "id": run_id,
-                "source": "market_data_auto",
-                "started_at": started_at,
-                "completed_at": None,
-                "status": "running",
-                "detail_json": {
-                    "mode": "targeted",
-                    "instrument_ids": instrument_ids,
-                    "instrument_count": len(instrument_ids),
-                    "history_backfill_ids": history_backfill_ids,
-                },
-            },
-        )
         try:
+            db.insert_sync_run(
+                connection,
+                {
+                    "id": run_id,
+                    "source": "market_data_auto",
+                    "started_at": started_at,
+                    "completed_at": None,
+                    "status": "running",
+                    "detail_json": {
+                        "mode": "targeted",
+                        "instrument_ids": instrument_ids,
+                        "instrument_count": len(instrument_ids),
+                        "history_backfill_ids": history_backfill_ids,
+                    },
+                },
+            )
             result = market_data.refresh_market_data(connection, instrument_ids=instrument_ids, include_fx=False)
             completed_at = _timestamp()
             detail = {
@@ -505,24 +511,28 @@ class PortfolioApplication:
             }
         except Exception as exc:
             completed_at = _timestamp()
-            db.insert_sync_run(
-                connection,
-                {
-                    "id": run_id,
-                    "source": "market_data_auto",
-                    "started_at": started_at,
-                    "completed_at": completed_at,
-                    "status": "failed",
-                    "detail_json": {
-                        "mode": "targeted",
-                        "instrument_ids": instrument_ids,
-                        "instrument_count": len(instrument_ids),
-                        "history_backfill_ids": history_backfill_ids,
-                        "trigger": "page_load",
-                        "error": str(exc),
+            try:
+                db.insert_sync_run(
+                    connection,
+                    {
+                        "id": run_id,
+                        "source": "market_data_auto",
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                        "status": "failed",
+                        "detail_json": {
+                            "mode": "targeted",
+                            "instrument_ids": instrument_ids,
+                            "instrument_count": len(instrument_ids),
+                            "history_backfill_ids": history_backfill_ids,
+                            "trigger": "page_load",
+                            "error": str(exc),
+                        },
                     },
-                },
-            )
+                )
+            except Exception:
+                # The dashboard must remain readable even if the database is temporarily read-only.
+                pass
             return {
                 "triggered": True,
                 "status": "failed",
