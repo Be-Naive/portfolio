@@ -405,10 +405,56 @@ class PortfolioApplication:
         )
         return [item["instrument_id"] for item in ranked]
 
+    @staticmethod
+    def _historical_instrument_ids_missing_market_prices(connection) -> list[str]:
+        rows = db.fetch_all(
+            connection,
+            """
+            SELECT i.id
+            FROM instruments i
+            WHERE EXISTS (
+                SELECT 1
+                FROM transactions t
+                WHERE t.instrument_id = i.id
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM price_history p
+                WHERE p.instrument_id = i.id
+                  AND p.source IN (
+                    'yahoo_chart',
+                    'yahoo_chart_close',
+                    'yahoo_chart_adjusted',
+                    'sina_kline',
+                    'eastmoney_fund_nav',
+                    'manual_csv'
+                  )
+            )
+              AND (
+                (
+                  i.broker = 'gtja'
+                  AND (
+                    (i.market IN ('CN', 'HK') AND i.asset_class IN ('equity', 'etf', 'security'))
+                    OR (i.market = 'CN' AND i.asset_class IN ('fund', 'bond_fund'))
+                  )
+                )
+                OR (
+                  i.broker = 'ibkr'
+                  AND i.asset_class IN ('equity', 'etf', 'security')
+                  AND (i.currency = 'USD' OR i.market = 'HK')
+                )
+              )
+            ORDER BY i.id
+            """,
+        )
+        return [row["id"] for row in rows]
+
     def _maybe_auto_refresh_market_data(self, connection, dashboard: Dict[str, object]) -> Dict[str, object]:
-        instrument_ids = self._current_holding_instrument_ids(dashboard)
+        active_ids = self._current_holding_instrument_ids(dashboard)
+        history_backfill_ids = self._historical_instrument_ids_missing_market_prices(connection)
+        instrument_ids = list(dict.fromkeys([*active_ids, *history_backfill_ids]))
         if not instrument_ids:
-            return {"triggered": False, "status": "skipped", "reason": "no_open_positions"}
+            return {"triggered": False, "status": "skipped", "reason": "no_market_instruments"}
 
         last_success = self._latest_market_sync(connection, success_only=True)
         if last_success and not _is_sync_stale(last_success.get("completed_at"), AUTO_MARKET_REFRESH_INTERVAL):
@@ -428,6 +474,7 @@ class PortfolioApplication:
                     "mode": "targeted",
                     "instrument_ids": instrument_ids,
                     "instrument_count": len(instrument_ids),
+                    "history_backfill_ids": history_backfill_ids,
                 },
             },
         )
@@ -437,6 +484,7 @@ class PortfolioApplication:
             detail = {
                 **result,
                 "trigger": "page_load",
+                "history_backfill_ids": history_backfill_ids,
             }
             db.insert_sync_run(
                 connection,
@@ -469,6 +517,7 @@ class PortfolioApplication:
                         "mode": "targeted",
                         "instrument_ids": instrument_ids,
                         "instrument_count": len(instrument_ids),
+                        "history_backfill_ids": history_backfill_ids,
                         "trigger": "page_load",
                         "error": str(exc),
                     },
