@@ -12,15 +12,27 @@
 
 ## 快速启动
 
+Windows 上可以直接双击根目录的 `start-dashboard.cmd`。它会自动选择
+`8000-8010` 之间的空闲端口，在后台守护看板，并打开正确的浏览器地址；
+进程意外退出后会自动重启。需要停止时双击 `stop-dashboard.cmd`。
+
+首次使用仍需安装环境：
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+也可以手动启动；端口冲突时通过 `PORT` 指定其他端口：
+
+```powershell
+$env:PORT = 8001
 .\.venv\Scripts\python.exe run.py
 ```
 
 浏览器打开：
 
-- [http://127.0.0.1:8000](http://127.0.0.1:8000)
+- 默认地址是 [http://127.0.0.1:8000](http://127.0.0.1:8000)，一键脚本会在端口被占用时自动改用下一个空闲端口。
 
 ## 当前主要能力
 
