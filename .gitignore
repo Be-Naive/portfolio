@@ -12,3 +12,7 @@ data/portfolio.db
 data/backups/
 tmp/
 *.log
+
+# Private broker statements and exported activity files
+*.pdf
+*.xml

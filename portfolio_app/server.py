@@ -4,6 +4,7 @@ import json
 from email.parser import BytesParser
 from email.policy import default as email_policy
 import tempfile
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -168,7 +169,7 @@ class PortfolioApplication:
 
     def _import_gtja(self, environ, start_response):
         form = self._parse_form(environ)
-        pdf_path = Path(form.get("pdf_path", str(DEFAULT_SAMPLE_PDF)))
+        pdf_path = _normalize_user_path(form.get("pdf_path"), DEFAULT_SAMPLE_PDF)
         if not pdf_path.exists():
             return self._render_dashboard(
                 start_response,
@@ -245,7 +246,7 @@ class PortfolioApplication:
 
     def _import_ibkr_xml(self, environ, start_response):
         form = self._parse_form(environ)
-        xml_path = Path(form.get("xml_path", str(DEFAULT_SAMPLE_XML))).expanduser()
+        xml_path = _normalize_user_path(form.get("xml_path"), DEFAULT_SAMPLE_XML)
         if not xml_path.exists():
             return self._render_dashboard(
                 start_response,
@@ -663,6 +664,14 @@ class PortfolioApplication:
 
 def _default_targets_text(targets: Dict[str, float]) -> str:
     return "\n".join(f"{key}: {value:.2f}" for key, value in targets.items())
+
+
+def _normalize_user_path(value: Optional[str], default_path: Path) -> Path:
+    raw_value = value if value is not None else str(default_path)
+    cleaned = "".join(character for character in raw_value if unicodedata.category(character) != "Cf").strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        cleaned = cleaned[1:-1].strip()
+    return Path(cleaned).expanduser()
 
 
 def _timestamp() -> str:

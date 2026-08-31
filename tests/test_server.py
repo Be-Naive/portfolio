@@ -5,10 +5,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 from portfolio_app import db
-from portfolio_app.server import PortfolioApplication, _format_sync_time, _is_sync_stale
+from portfolio_app.server import (
+    PortfolioApplication,
+    _format_sync_time,
+    _is_sync_stale,
+    _normalize_user_path,
+)
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_normalize_user_path_removes_copy_paste_formatting(self):
+        raw_path = '\u202a  "C:\\Users\\BeNaive\\My Files\\statement.pdf\u202c" \r\n'
+
+        self.assertEqual(
+            _normalize_user_path(raw_path, Path("fallback.pdf")),
+            Path(r"C:\Users\BeNaive\My Files\statement.pdf"),
+        )
+
     def test_current_holding_instrument_ids_only_returns_open_products(self):
         dashboard = {
             "products": [
