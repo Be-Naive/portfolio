@@ -1,7 +1,7 @@
 import unittest
 
 from datetime import date
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from portfolio_app.market_data import (
     _eastmoney_fund_code_for_instrument,
@@ -40,18 +40,20 @@ class MarketDataTest(unittest.TestCase):
         session = Mock()
         session.get.side_effect = [first_response, second_response]
 
-        rows = _fetch_eastmoney_fund_history(
-            session,
-            {"id": "gtja:000218", "currency": "CNY"},
-            "000218",
-            start_date="2025-03-18",
-        )
+        with patch("portfolio_app.market_data.current_valuation_date", return_value=date(2026, 9, 8)):
+            rows = _fetch_eastmoney_fund_history(
+                session,
+                {"id": "gtja:000218", "currency": "CNY"},
+                "000218",
+                start_date="2025-03-18",
+            )
 
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[-1]["price_date"], "2025-07-14")
         self.assertEqual(rows[-1]["close_price"], 2.8217)
         self.assertEqual(session.get.call_count, 2)
         self.assertEqual(session.get.call_args_list[1].kwargs["params"]["pageIndex"], 2)
+        self.assertEqual(session.get.call_args_list[0].kwargs["params"]["endDate"], "2026-09-08")
 
     def test_eastmoney_fund_code_for_off_exchange_cn_fund(self):
         self.assertEqual(

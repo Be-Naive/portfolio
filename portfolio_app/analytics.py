@@ -7,6 +7,7 @@ import json
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from . import db
+from .time_utils import current_valuation_date
 
 
 BUY_ACTIVITIES = {"security_buy", "fund_subscription_confirm", "fund_subscription_fund_out", "repo_open"}
@@ -581,7 +582,7 @@ def _build_timeseries(transactions, price_rows, fx_rows, base_currency):
         }
 
     start = datetime.strptime(transactions[0]["trade_date"], "%Y-%m-%d").date()
-    end = date.today()
+    end = current_valuation_date()
     position_state = defaultdict(float)
     cash_state = defaultdict(float)
     effective_bridge_by_currency = defaultdict(float)

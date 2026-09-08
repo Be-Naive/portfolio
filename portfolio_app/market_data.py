@@ -10,6 +10,8 @@ import xml.etree.ElementTree as ET
 
 import requests
 
+from .time_utils import current_valuation_date
+
 
 ECB_HISTORY_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.xml"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -242,7 +244,7 @@ def _resolve_incremental_start(
     if transaction_start:
         return transaction_start - timedelta(days=padding_days)
 
-    return datetime.now().date() - timedelta(days=fallback_days)
+    return current_valuation_date() - timedelta(days=fallback_days)
 
 
 def import_price_csv(connection, csv_path: Path) -> dict:
@@ -324,7 +326,7 @@ def _fetch_yahoo_history(
     request_timeout: int = 30,
 ) -> list[dict]:
     if start_date is None:
-        start_date = datetime.now().date() - timedelta(days=3650)
+        start_date = current_valuation_date() - timedelta(days=3650)
     response = session.get(
         YAHOO_CHART_URL.format(symbol=yahoo_symbol),
         params={
@@ -384,7 +386,7 @@ def _fetch_sina_history(
     if start_date is None:
         datalen = 4000
     else:
-        span_days = max(30, (datetime.now().date() - start_date).days + 10)
+        span_days = max(30, (current_valuation_date() - start_date).days + 10)
         datalen = min(4000, span_days)
     response = session.get(
         SINA_KLINE_URL,
@@ -439,7 +441,7 @@ def _fetch_eastmoney_fund_history(
                 "pageIndex": page_index,
                 "pageSize": 20,
                 "startDate": start_date,
-                "endDate": datetime.now().date().isoformat(),
+                "endDate": current_valuation_date().isoformat(),
             },
             headers={"Referer": f"https://fundf10.eastmoney.com/jjjz_{fund_code}.html"},
             timeout=request_timeout,

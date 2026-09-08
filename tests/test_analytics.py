@@ -2,6 +2,7 @@ import json
 import sqlite3
 import unittest
 from datetime import date, timedelta
+from unittest.mock import patch
 
 from portfolio_app import db
 from portfolio_app.analytics import (
@@ -25,6 +26,43 @@ from portfolio_app.analytics import (
 
 
 class AnalyticsTest(unittest.TestCase):
+    def test_timeseries_extends_to_current_china_valuation_date(self):
+        transactions = [
+            {
+                "trade_date": "2026-09-07",
+                "activity_type": "security_buy",
+                "description": "China holding",
+                "external_flow": 0,
+                "quantity": 1.0,
+                "price": 100.0,
+                "gross_amount": 100.0,
+                "cash_amount": -100.0,
+                "position_balance": None,
+                "currency": "CNY",
+                "instrument_id": "test:cn",
+                "account_id": "acct",
+                "asset_class": "equity",
+                "name": "China holding",
+                "symbol": "TEST",
+                "other_fee": None,
+            }
+        ]
+        price_rows = [
+            {
+                "price_date": "2026-09-08",
+                "instrument_id": "test:cn",
+                "close_price": 110.0,
+                "currency": "CNY",
+                "asset_class": "equity",
+            }
+        ]
+
+        with patch("portfolio_app.analytics.current_valuation_date", return_value=date(2026, 9, 8)):
+            series = _build_timeseries(transactions, price_rows, [], "CNY")
+
+        self.assertEqual(series["nav"][-1], {"date": "2026-09-08", "value": 10.0})
+        self.assertEqual(series["product_profit_breakdown"][-1]["total"], 10.0)
+
     def test_dashboard_headline_matches_timeseries_endpoint(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
